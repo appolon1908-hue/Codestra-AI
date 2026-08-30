@@ -1,12 +1,18 @@
+import hashlib
+import os
 from enum import StrEnum
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
-app = FastAPI(title="Codestra AI Gateway", version="0.1.0")
+from .db import get_session
+from .models import AIRequestModel
+from .providers.router import resolve_route
 
-EXTERNAL_MODEL_CALLS_ENABLED = False
+app = FastAPI(title="Codestra AI Gateway", version="0.2.0")
+EXTERNAL_MODEL_CALLS_ENABLED = os.getenv("EXTERNAL_MODEL_CALLS_ENABLED", "false").lower() == "true"
 
 class TaskType(StrEnum):
     COPY = "copy"
@@ -25,6 +31,8 @@ class GenerationResponse(BaseModel):
     request_id: UUID
     status: str
     output: str | None = None
+    provider: str | None = None
+    model: str | None = None
 
 @app.get("/health")
 def health() -> dict[str, object]:
@@ -32,17 +40,16 @@ def health() -> dict[str, object]:
 
 @app.get("/v1/capabilities")
 def capabilities() -> dict[str, object]:
-    return {
-        "structured_generation": True,
-        "audit": True,
-        "usage_accounting": True,
-        "external_model_calls": EXTERNAL_MODEL_CALLS_ENABLED,
-        "business_action_authority": False,
-    }
+    return {"structured_generation": True, "audit": True, "usage_accounting": True, "external_model_calls": EXTERNAL_MODEL_CALLS_ENABLED, "business_action_authority": False}
 
 @app.post("/v1/generate", response_model=GenerationResponse)
-def generate(body: GenerationRequest) -> GenerationResponse:
+async def generate(body: GenerationRequest, session: AsyncSession = Depends(get_session)) -> GenerationResponse:
+    route = resolve_route(body.task.value)
     request_id = uuid4()
+    digest = hashlib.sha256(body.input.encode("utf-8")).hexdigest()
+    row = AIRequestModel(id=request_id, tenant_id=body.tenant_id, task=body.task.value, provider=route.provider.value, model=route.model, status="blocked_by_capability" if not EXTERNAL_MODEL_CALLS_ENABLED else "queued", input_digest=digest)
+    session.add(row)
+    await session.commit()
     if not EXTERNAL_MODEL_CALLS_ENABLED:
-        return GenerationResponse(request_id=request_id, status="blocked_by_capability")
-    raise HTTPException(status_code=501, detail="provider_router_not_implemented")
+        return GenerationResponse(request_id=request_id, status="blocked_by_capability", provider=route.provider.value, model=route.model)
+    raise HTTPException(status_code=501, detail="external_provider_execution_not_implemented")
