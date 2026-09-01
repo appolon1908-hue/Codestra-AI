@@ -174,7 +174,12 @@ def test_freshness_passes_current_marker_and_fails_stale_marker():
             capture_output=True,
             check=True,
         ).stdout.strip()
-        (root / current).mkdir()
+        artifact = root / current
+        artifact.mkdir()
+        (artifact / "database.dump.gpg").write_text("synthetic")
+        (artifact / "METADATA").write_text("synthetic")
+        with (artifact / "SHA256SUMS").open("w") as manifest:
+            subprocess.run(["sha256sum", "database.dump.gpg", "METADATA"], cwd=artifact, text=True, stdout=manifest, check=True)
         (root / "LAST_SUCCESS").write_text(current + "\n")
         env = {
             **os.environ,
@@ -182,6 +187,9 @@ def test_freshness_passes_current_marker_and_fails_stale_marker():
             "CODESTRA_RECOVERY_MAX_AGE_SECONDS": "120",
         }
         assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 0
+        (artifact / "database.dump.gpg").write_text("corrupt")
+        assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 1
+        (artifact / "database.dump.gpg").write_text("synthetic")
         stale = "20200101T000000Z"
         (root / stale).mkdir()
         (root / "LAST_SUCCESS").write_text(stale + "\n")
