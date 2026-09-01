@@ -18,6 +18,11 @@ decrypts only inside a temporary mode-0700 directory, restores with
 `--exit-on-error`, and checks the table, required columns, and tenant/idempotency
 index before atomically publishing a checksum-bearing result.
 
+`operations/recovery/check-recovery-freshness.sh` evaluates either a published
+backup directory or checksum-bearing restore result against an explicitly
+supplied maximum age. The deployment owner remains responsible for approving
+the actual RPO/RTO thresholds and scheduling the checks.
+
 Rollback requires the release record to identify both current and previous Git
 SHA/image digest tuples. Restore is not the default rollback for an application
 failure: first redeploy the reviewed previous immutable image after confirming

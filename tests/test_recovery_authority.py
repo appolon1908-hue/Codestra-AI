@@ -7,6 +7,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 BACKUP = (ROOT / "operations/recovery/backup-postgres.sh").read_text()
 RESTORE = (ROOT / "operations/recovery/verify-isolated-restore.sh").read_text()
+FRESHNESS = ROOT / "operations/recovery/check-recovery-freshness.sh"
 
 
 def test_backup_is_encrypted_atomic_and_release_bound():
@@ -142,3 +143,26 @@ def test_restore_refuses_source_database_identity_before_pg_restore():
         )
         assert result.returncode == 2
         assert "refusing restore into source database identity" in result.stderr
+
+
+def test_freshness_passes_current_marker_and_fails_stale_marker():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        current = subprocess.run(
+            ["date", "-u", "+%Y%m%dT%H%M%SZ"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        (root / current).mkdir()
+        (root / "LAST_SUCCESS").write_text(current + "\n")
+        env = {
+            **os.environ,
+            "CODESTRA_RECOVERY_ROOT": str(root),
+            "CODESTRA_RECOVERY_MAX_AGE_SECONDS": "120",
+        }
+        assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 0
+        stale = "20200101T000000Z"
+        (root / stale).mkdir()
+        (root / "LAST_SUCCESS").write_text(stale + "\n")
+        assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 1
