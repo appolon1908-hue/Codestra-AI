@@ -3,12 +3,14 @@
 These commands are source controls; they do not authorize a production change.
 
 Before a migration or rollout, an authorized operator runs
-`operations/recovery/backup-postgres.sh` with a protected PostgreSQL DSN, a
+`operations/recovery/backup-postgres.sh` with libpq `PGHOST`, `PGPORT`,
+`PGDATABASE`, `PGUSER`, and an owner-protected `PGPASSFILE`, a
 root-owned mode-0700 backup directory, the exact release SHA, exact image digest,
 and an approved OpenPGP recovery recipient. The command creates a custom-format
 PostgreSQL dump, validates its catalog, encrypts it, removes the plaintext, and
 atomically publishes checksums, immutable release metadata, and `LAST_SUCCESS`.
-It never prints the DSN or encryption recipient.
+It keeps database credentials out of process arguments and never prints the
+passfile or encryption recipient.
 
 Restore verification must use a disposable database whose name explicitly
 contains `restore` and differs from the source database recorded in the backup.

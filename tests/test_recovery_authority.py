@@ -20,7 +20,9 @@ def test_backup_is_encrypted_atomic_and_release_bound():
     assert "sha256sum database.dump.gpg METADATA >SHA256SUMS" in BACKUP
     assert 'sha256sum "$work/database.dump.gpg"' not in BACKUP
     assert 'mv "$marker" "$backup_root/LAST_SUCCESS"' in BACKUP
-    assert "echo \"$POSTGRES_DSN\"" not in BACKUP
+    assert "POSTGRES_DSN" not in BACKUP
+    assert 'sync "$work/database.dump.gpg"' in BACKUP
+    assert 'sync "$marker"' in BACKUP
 
 
 def test_restore_is_explicit_isolated_and_verifying():
@@ -31,10 +33,14 @@ def test_restore_is_explicit_isolated_and_verifying():
     assert "pg_restore" in RESTORE and "--exit-on-error" in RESTORE
     assert "ai_requests" in RESTORE
     assert "uq_ai_request_idempotency" in RESTORE
+    assert "i.indisunique and i.indisvalid and i.indisready" in RESTORE
+    assert "array['tenant_id','idempotency_key']::text[]" in RESTORE
     assert "RESTORE=PASS" in RESTORE
     assert 'sha256sum "$result_name"' in RESTORE
     assert 'sha256sum "$result"' not in RESTORE
-    assert "echo \"$POSTGRES_DSN\"" not in RESTORE
+    assert "POSTGRES_DSN" not in RESTORE
+    assert 'flock -n 8' in RESTORE
+    assert "restore evidence stamp collision" in RESTORE
 
 
 def test_no_automatic_destructive_production_path():
@@ -76,12 +82,19 @@ def test_backup_publishes_relocatable_verified_manifest():
         root = Path(directory)
         tools = _mock_tools(root)
         backup_root = root / "backups"
+        passfile = root / "pgpass"
+        passfile.write_text("synthetic")
+        passfile.chmod(0o600)
         result = subprocess.run(
             [str(ROOT / "operations/recovery/backup-postgres.sh")],
             env={
                 **os.environ,
                 "PATH": f"{tools}:{os.environ['PATH']}",
-                "POSTGRES_DSN": "postgresql://synthetic.invalid/codestra_ai",
+                "PGHOST": "synthetic.invalid",
+                "PGPORT": "5432",
+                "PGDATABASE": "codestra_ai",
+                "PGUSER": "synthetic",
+                "PGPASSFILE": str(passfile),
                 "CODESTRA_AI_BACKUP_ROOT": str(backup_root),
                 "CODESTRA_RELEASE_SHA": "1" * 40,
                 "CODESTRA_IMAGE_DIGEST": "sha256:" + "2" * 64,
@@ -111,6 +124,9 @@ def test_restore_refuses_source_database_identity_before_pg_restore():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         tools = _mock_tools(root)
+        passfile = root / "pgpass"
+        passfile.write_text("synthetic")
+        passfile.chmod(0o600)
         backup = root / "backup"
         backup.mkdir()
         (backup / "database.dump.gpg").write_text("synthetic")
@@ -131,7 +147,11 @@ def test_restore_refuses_source_database_identity_before_pg_restore():
             env={
                 **os.environ,
                 "PATH": f"{tools}:{os.environ['PATH']}",
-                "POSTGRES_DSN": "postgresql://synthetic.invalid/codestra_ai",
+                "PGHOST": "synthetic.invalid",
+                "PGPORT": "5432",
+                "PGDATABASE": "codestra_ai",
+                "PGUSER": "synthetic",
+                "PGPASSFILE": str(passfile),
                 "CODESTRA_AI_BACKUP_DIR": str(backup),
                 "CODESTRA_AI_RESTORE_EVIDENCE_DIR": str(root / "evidence"),
                 "ALLOW_ISOLATED_RESTORE": "true",
