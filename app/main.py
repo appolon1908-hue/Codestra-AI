@@ -6,7 +6,7 @@ import os
 import asyncio
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
@@ -22,7 +22,10 @@ from .providers.router import resolve_route
 
 app = FastAPI(title="Codestra AI Gateway", version="0.3.0")
 router = APIRouter(prefix="/v1/ai")
-EXTERNAL_MODEL_CALLS_ENABLED = os.getenv("EXTERNAL_MODEL_CALLS_ENABLED", "false").lower() == "true"
+EXTERNAL_MODEL_CALLS_ENABLED = (
+    os.getenv("EXTERNAL_MODEL_CALLS_ENABLED", "false").lower() == "true"
+)
+EXTERNAL_MODEL_EXECUTION_AVAILABLE = False
 SERVICE = "codestra-ai"
 
 
@@ -33,13 +36,19 @@ async def operational_headers(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
-        response = JSONResponse(status_code=500, content={"detail": "internal_error", "correlation_id": correlation_id})
+        response = JSONResponse(
+            status_code=500,
+            content={"detail": "internal_error", "correlation_id": correlation_id},
+        )
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Correlation-ID"] = correlation_id
     return response
 
+
 TenantHeader = Annotated[str, Header(alias="X-Tenant-ID", min_length=1, max_length=128)]
-IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
+IdempotencyHeader = Annotated[
+    str, Header(alias="Idempotency-Key", min_length=8, max_length=200)
+]
 
 
 class TaskType(StrEnum):
@@ -101,8 +110,15 @@ def _response(row: AIRequestModel) -> GenerationResponse:
 
 @app.get("/health")
 def health(request: Request = None) -> dict[str, object]:
-    correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
-    return {"status": "ok", "service": SERVICE, "timestamp": datetime.now(timezone.utc).isoformat(), "correlation_id": correlation_id}
+    correlation_id = getattr(
+        getattr(request, "state", None), "correlation_id", str(uuid4())
+    )
+    return {
+        "status": "ok",
+        "service": SERVICE,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "correlation_id": correlation_id,
+    }
 
 
 @app.get("/ready")
@@ -110,40 +126,72 @@ async def ready(request: Request, session: AsyncSession = Depends(get_session)):
     try:
         await asyncio.wait_for(session.execute(select(1)), timeout=2.0)
     except Exception:
-        return JSONResponse(status_code=503, content={"status": "not_ready", "service": SERVICE, "dependencies": {"database": "unavailable"}, "correlation_id": request.state.correlation_id})
-    return {"status": "ready", "service": SERVICE, "dependencies": {"database": "ready", "configuration": "ready"}, "correlation_id": request.state.correlation_id}
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "service": SERVICE,
+                "dependencies": {"database": "unavailable"},
+                "correlation_id": request.state.correlation_id,
+            },
+        )
+    return {
+        "status": "ready",
+        "service": SERVICE,
+        "dependencies": {"database": "ready", "configuration": "ready"},
+        "correlation_id": request.state.correlation_id,
+    }
 
 
 @app.get("/version")
 def version(request: Request = None) -> dict[str, object]:
-    correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
-    return {"service": SERVICE, "application_version": app.version, "api_versions": ["v1"], "git_sha": os.getenv("CODESTRA_GIT_SHA", "unknown"), "image_digest": os.getenv("CODESTRA_IMAGE_DIGEST", "unknown"), "build_timestamp": os.getenv("CODESTRA_BUILD_TIMESTAMP", "unknown"), "migration_revision": os.getenv("CODESTRA_MIGRATION_REVISION", "unknown"), "environment": os.getenv("CODESTRA_ENVIRONMENT", "unknown"), "correlation_id": correlation_id}
+    correlation_id = getattr(
+        getattr(request, "state", None), "correlation_id", str(uuid4())
+    )
+    return {
+        "service": SERVICE,
+        "application_version": app.version,
+        "api_versions": ["v1"],
+        "git_sha": os.getenv("CODESTRA_GIT_SHA", "unknown"),
+        "image_digest": os.getenv("CODESTRA_IMAGE_DIGEST", "unknown"),
+        "build_timestamp": os.getenv("CODESTRA_BUILD_TIMESTAMP", "unknown"),
+        "migration_revision": os.getenv("CODESTRA_MIGRATION_REVISION", "unknown"),
+        "environment": os.getenv("CODESTRA_ENVIRONMENT", "unknown"),
+        "correlation_id": correlation_id,
+    }
 
 
 @app.get("/capabilities")
 @router.get("/capabilities")
 def capabilities(request: Request = None) -> dict[str, object]:
-    correlation_id = getattr(getattr(request, "state", None), "correlation_id", str(uuid4()))
+    correlation_id = getattr(
+        getattr(request, "state", None), "correlation_id", str(uuid4())
+    )
+    effective_external_calls = (
+        EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
+    )
     return {
         "service": SERVICE,
         "maintenance_mode": os.getenv("MAINTENANCE_MODE", "false").lower() == "true",
         "degraded_mode": False,
         "business_writes_enabled": False,
-        "external_delivery_enabled": EXTERNAL_MODEL_CALLS_ENABLED,
-        "external_model_calls_enabled": EXTERNAL_MODEL_CALLS_ENABLED,
-        "read_only_mode": not EXTERNAL_MODEL_CALLS_ENABLED,
-        "simulation_enabled": not EXTERNAL_MODEL_CALLS_ENABLED,
+        "external_delivery_enabled": effective_external_calls,
+        "external_model_calls_enabled": effective_external_calls,
+        "read_only_mode": not effective_external_calls,
+        "simulation_enabled": not effective_external_calls,
         "supported_api_versions": ["v1"],
         "structured_generation": True,
         "audit": True,
         "usage_accounting": True,
-        "external_model_calls": EXTERNAL_MODEL_CALLS_ENABLED,
+        "external_model_calls": effective_external_calls,
         "business_action_authority": False,
         "correlation_id": correlation_id,
     }
 
 
-@router.post("/generate", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/generate", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED
+)
 async def generate(
     body: GenerationRequest,
     x_tenant_id: TenantHeader,
@@ -171,7 +219,11 @@ async def generate(
         task=body.task.value,
         provider=route.provider.value,
         model=route.model,
-        status="blocked_by_capability" if not EXTERNAL_MODEL_CALLS_ENABLED else "queued",
+        status=(
+            "queued"
+            if EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
+            else "blocked_by_capability"
+        ),
         input_digest=input_digest,
         idempotency_key=idempotency_key,
         request_fingerprint=fingerprint,
@@ -193,8 +245,10 @@ async def generate(
         return _response(row)
     await session.refresh(row)
 
-    if EXTERNAL_MODEL_CALLS_ENABLED:
-        raise HTTPException(status_code=501, detail="external_provider_execution_not_implemented")
+    if EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE:
+        raise HTTPException(
+            status_code=501, detail="external_provider_execution_not_implemented"
+        )
     return _response(row)
 
 
