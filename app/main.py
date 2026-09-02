@@ -8,7 +8,7 @@ import re
 import time
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -42,6 +42,7 @@ API_VERSION = "0.4.0"
 EXTERNAL_MODEL_CALLS_ENABLED = (
     os.getenv("EXTERNAL_MODEL_CALLS_ENABLED", "false").strip().lower() == "true"
 )
+EXTERNAL_MODEL_EXECUTION_AVAILABLE = False
 TELEMETRY_EXPORT_ENABLED = (
     os.getenv("TELEMETRY_EXPORT_ENABLED", "false").strip().lower() == "true"
 )
@@ -119,7 +120,6 @@ class PagedEvents(BaseModel):
 
 class CancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     expected_version: int = Field(ge=1)
     reason: str = Field(
         min_length=1,
@@ -157,18 +157,13 @@ def _operation(request: Request) -> str:
     path = getattr(route, "path", None)
     if isinstance(path, str):
         return path
-    raw = request.url.path
-    if raw == "/metrics":
-        return "/metrics"
-    return "unmatched"
+    return "/metrics" if request.url.path == "/metrics" else "unmatched"
 
 
 def _required_scope(path: str, method: str) -> str | None:
     if path == "/metrics":
         return "metrics.read"
-    if not path.startswith("/v1/ai/"):
-        return None
-    if path.endswith("/capabilities"):
+    if not path.startswith("/v1/ai/") or path.endswith("/capabilities"):
         return None
     if method == "GET":
         return "ai.read"
@@ -189,7 +184,6 @@ async def security_observability_boundary(request: Request, call_next):
             message="X-Correlation-ID is outside the accepted format",
         )
     request.state.correlation_id = supplied or str(uuid4())
-
     scope = _required_scope(request.url.path, request.method)
     if scope is not None:
         try:
@@ -207,7 +201,6 @@ async def security_observability_boundary(request: Request, call_next):
                 code=reason,
                 message="request authorization failed",
             )
-
     started = time.perf_counter()
     try:
         response = await call_next(request)
@@ -227,13 +220,11 @@ async def security_observability_boundary(request: Request, call_next):
             message="request could not be completed",
             retryable=True,
         )
-
     operation = _operation(request)
-    status_class = f"{response.status_code // 100}xx"
     REQUESTS.labels(
         operation=operation,
         method=request.method,
-        status_class=status_class,
+        status_class=f"{response.status_code // 100}xx",
     ).inc()
     DURATION.labels(operation=operation, method=request.method).observe(
         time.perf_counter() - started
@@ -310,10 +301,7 @@ async def _event(
 
 
 def _encode_cursor(created_at: datetime, identity: UUID) -> str:
-    raw = json.dumps(
-        [created_at.isoformat(), str(identity)],
-        separators=(",", ":"),
-    ).encode("utf-8")
+    raw = json.dumps([created_at.isoformat(), str(identity)], separators=(",", ":")).encode()
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
@@ -341,12 +329,9 @@ def health() -> dict[str, object]:
     }
 
 
-@app.get("/health/ready")
-@app.get("/ready")
-async def ready(
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> Response | dict[str, object]:
+@app.get("/health/ready", response_model=None)
+@app.get("/ready", response_model=None)
+async def ready(request: Request, session: AsyncSession = Depends(get_session)):
     try:
         await session.execute(select(1))
     except Exception:
@@ -370,6 +355,7 @@ def version() -> dict[str, object]:
         "service": SERVICE,
         "application_version": API_VERSION,
         "source_sha": SOURCE_SHA,
+        "git_sha": SOURCE_SHA,
         "image_digest": IMAGE_DIGEST,
         "environment": APP_ENV,
         "deployment_id": DEPLOYMENT_ID,
@@ -381,7 +367,7 @@ def version() -> dict[str, object]:
 @app.get("/metrics")
 def metrics() -> Response:
     CAPABILITY.labels(capability="external_model_calls").set(
-        1 if EXTERNAL_MODEL_CALLS_ENABLED else 0
+        1 if EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE else 0
     )
     body, media_type = render_metrics()
     return Response(content=body, media_type=media_type)
@@ -389,6 +375,7 @@ def metrics() -> Response:
 
 @router.get("/capabilities")
 def capabilities() -> dict[str, object]:
+    provider_enabled = EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
     return {
         "structured_generation": True,
         "audit": True,
@@ -396,7 +383,11 @@ def capabilities() -> dict[str, object]:
         "cancellation": True,
         "policy_evaluation": True,
         "middleware_operation_tracking": True,
-        "external_model_calls": EXTERNAL_MODEL_CALLS_ENABLED,
+        "business_writes_enabled": False,
+        "external_delivery_enabled": provider_enabled,
+        "external_model_calls_enabled": provider_enabled,
+        "external_model_calls": provider_enabled,
+        "read_only_mode": not provider_enabled,
         "telemetry_export": TELEMETRY_EXPORT_ENABLED,
         "business_action_authority": False,
     }
@@ -409,7 +400,9 @@ def models() -> dict[str, object]:
             "task": task,
             "provider": route.provider.value,
             "model": route.model,
-            "external_execution_enabled": EXTERNAL_MODEL_CALLS_ENABLED,
+            "external_execution_enabled": (
+                EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
+            ),
         }
         for task, route in sorted(ROUTES.items())
     ]
@@ -435,11 +428,7 @@ def policies() -> dict[str, object]:
     }
 
 
-@router.post(
-    "/generate",
-    response_model=GenerationResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
+@router.post("/generate", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
 async def generate(
     body: GenerationRequest,
     x_tenant_id: TenantHeader,
@@ -452,7 +441,6 @@ async def generate(
     correlation_id = x_correlation_id or str(uuid4())
     actor_id = x_codestra_actor or "codestra-ai-api"
     input_digest, fingerprint = _fingerprint(tenant_id, body)
-
     existing = await session.execute(
         select(AIRequestModel).where(
             AIRequestModel.tenant_id == tenant_id,
@@ -466,17 +454,15 @@ async def generate(
             raise HTTPException(status_code=409, detail="idempotency_conflict")
         return _response(row)
 
+    provider_enabled = EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
     route = resolve_route(body.task.value)
-    initial_status = (
-        "queued" if EXTERNAL_MODEL_CALLS_ENABLED else "blocked_by_capability"
-    )
     row = AIRequestModel(
         id=uuid4(),
         tenant_id=tenant_id,
         task=body.task.value,
         provider=route.provider.value,
         model=route.model,
-        status=initial_status,
+        status="queued" if provider_enabled else "blocked_by_capability",
         input_digest=input_digest,
         idempotency_key=idempotency_key,
         request_fingerprint=fingerprint,
@@ -491,9 +477,9 @@ async def generate(
             previous_status=None,
             actor_id=actor_id,
             safe_detail=(
-                "external_model_calls_disabled"
-                if not EXTERNAL_MODEL_CALLS_ENABLED
-                else "submitted_for_middleware_dispatch"
+                "submitted_for_middleware_dispatch"
+                if provider_enabled
+                else "external_model_calls_disabled"
             ),
         )
         await session.commit()
@@ -512,7 +498,7 @@ async def generate(
         return _response(row)
     await session.refresh(row)
 
-    if not EXTERNAL_MODEL_CALLS_ENABLED:
+    if not provider_enabled:
         POLICY_DENIALS.labels(reason="capability_disabled").inc()
         return _response(row)
 
@@ -536,9 +522,7 @@ async def generate(
         )
     except MiddlewareSubmissionError as exc:
         previous = row.status
-        row.status = (
-            "reconciliation_required" if exc.outcome_unknown else "failed"
-        )
+        row.status = "reconciliation_required" if exc.outcome_unknown else "failed"
         row.resource_version += 1
         await _event(
             session,
@@ -585,9 +569,7 @@ async def list_requests(
     session: AsyncSession = Depends(get_session),
 ) -> PagedRequests:
     position = _decode_cursor(cursor)
-    statement = select(AIRequestModel).where(
-        AIRequestModel.tenant_id == x_tenant_id
-    )
+    statement = select(AIRequestModel).where(AIRequestModel.tenant_id == x_tenant_id)
     if status_filter:
         statement = statement.where(AIRequestModel.status == status_filter)
     if task:
@@ -603,18 +585,11 @@ async def list_requests(
             )
         )
     result = await session.execute(
-        statement.order_by(
-            AIRequestModel.created_at.desc(),
-            AIRequestModel.id.desc(),
-        ).limit(limit + 1)
+        statement.order_by(AIRequestModel.created_at.desc(), AIRequestModel.id.desc()).limit(limit + 1)
     )
     rows = list(result.scalars().all())
     items = rows[:limit]
-    next_cursor = (
-        _encode_cursor(items[-1].created_at, items[-1].id)
-        if len(rows) > limit and items
-        else None
-    )
+    next_cursor = _encode_cursor(items[-1].created_at, items[-1].id) if len(rows) > limit and items else None
     return PagedRequests(items=[_response(row) for row in items], next_cursor=next_cursor)
 
 
@@ -658,9 +633,7 @@ async def get_request_events(
     )
     if cursor is not None:
         statement = statement.where(AIRequestEventModel.id > cursor)
-    result = await session.execute(
-        statement.order_by(AIRequestEventModel.id.asc()).limit(limit + 1)
-    )
+    result = await session.execute(statement.order_by(AIRequestEventModel.id.asc()).limit(limit + 1))
     rows = list(result.scalars().all())
     items = rows[:limit]
     return PagedEvents(
@@ -692,10 +665,7 @@ async def cancel_request(
     del idempotency_key
     result = await session.execute(
         select(AIRequestModel)
-        .where(
-            AIRequestModel.id == request_id,
-            AIRequestModel.tenant_id == x_tenant_id,
-        )
+        .where(AIRequestModel.id == request_id, AIRequestModel.tenant_id == x_tenant_id)
         .with_for_update()
     )
     row = result.scalar_one_or_none()
@@ -705,13 +675,8 @@ async def cancel_request(
         raise HTTPException(status_code=409, detail="stale_resource_version")
     if row.status in {"completed", "failed", "cancelled"}:
         raise HTTPException(status_code=409, detail="request_not_cancellable")
-
     previous = row.status
-    row.status = (
-        "cancellation_pending"
-        if row.middleware_operation_id
-        else "cancelled"
-    )
+    row.status = "cancellation_pending" if row.middleware_operation_id else "cancelled"
     row.cancelled_at = datetime.now(UTC) if row.status == "cancelled" else None
     row.resource_version += 1
     await _event(
@@ -756,6 +721,11 @@ async def usage(
         "output_tokens": int(output_tokens),
         "cost_micros": int(cost_micros),
     }
+
+
+@app.get("/capabilities", include_in_schema=False)
+def capabilities_alias() -> dict[str, object]:
+    return capabilities()
 
 
 app.include_router(router)
