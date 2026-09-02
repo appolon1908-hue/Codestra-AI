@@ -151,6 +151,7 @@ async def generate(
         row = result.scalar_one_or_none()
         if row is None or row.request_fingerprint != fingerprint:
             raise HTTPException(status_code=409, detail="idempotency_conflict")
+        audit_event("ai_request_replayed", request_id=str(row.id), status=row.status)
         return _response(row)
     await session.refresh(row)
     audit_event("ai_request_recorded", request_id=str(row.id), status=row.status)

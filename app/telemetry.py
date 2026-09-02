@@ -24,6 +24,20 @@ correlation_id_context: ContextVar[str | None] = ContextVar("correlation_id", de
 audit_logger = logging.getLogger("codestra.ai.audit")
 
 
+def configure_audit_logging() -> None:
+    """Ensure sanitized audit events are emitted independently of Uvicorn defaults."""
+    if not any(getattr(handler, "_codestra_audit", False) for handler in audit_logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler._codestra_audit = True  # type: ignore[attr-defined]
+        audit_logger.addHandler(handler)
+    audit_logger.setLevel(logging.INFO)
+    audit_logger.propagate = False
+
+
+configure_audit_logging()
+
+
 def private_otlp_endpoint(value: str) -> str:
     endpoint = value.strip().rstrip("/")
     parsed = urlsplit(endpoint)
@@ -89,7 +103,14 @@ def install_correlation_middleware(app: FastAPI) -> None:
         if span.is_recording():
             span.set_attribute("codestra.correlation_id", correlation_id)
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except Exception:
+                audit_event("request_failed")
+                response = JSONResponse(
+                    status_code=500,
+                    content={"detail": "internal_server_error"},
+                )
             response.headers[CORRELATION_HEADER] = correlation_id
             return response
         finally:
