@@ -1,0 +1,37 @@
+asyncapi: 3.0.0
+info:
+  title: Codestra AI Events
+  version: 1.0.0
+  description: Sanitized durable lifecycle events emitted after committed AI request state changes.
+channels:
+  aiRequestEvents:
+    address: codestra.ai.requests
+    messages:
+      aiRequestEvent:
+        $ref: "#/components/messages/AiRequestEvent"
+operations:
+  receiveAiRequestEvents:
+    action: receive
+    channel:
+      $ref: "#/channels/aiRequestEvents"
+components:
+  messages:
+    AiRequestEvent:
+      name: AiRequestEvent
+      payload:
+        type: object
+        additionalProperties: false
+        required: [event_id, event_type, request_id, tenant_scope, occurred_at]
+        properties:
+          event_id: {type: string, format: uuid}
+          event_type:
+            type: string
+            enum:
+              - ai.request.accepted
+              - ai.middleware_operation_accepted
+              - ai.middleware_submission_failed
+              - ai.request.cancellation_requested
+          request_id: {type: string, format: uuid}
+          tenant_scope: {type: string, const: protected}
+          occurred_at: {type: string, format: date-time}
+          safe_detail: {type: [string, "null"], maxLength: 240}
