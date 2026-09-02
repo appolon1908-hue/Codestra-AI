@@ -113,7 +113,11 @@ async def complete(
         await _record_event(
             session,
             request,
-            "ai.middleware_cancellation_accepted",
+            (
+                "ai.middleware_cancellation_accepted"
+                if terminal
+                else "ai.middleware_cancellation_reconciliation_required"
+            ),
             previous,
             "cancelled" if terminal else f"nonterminal:{middleware_state[:64]}",
         )

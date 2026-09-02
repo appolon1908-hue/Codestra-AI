@@ -10,7 +10,13 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.main import CancelRequest, GenerationRequest, TaskType, cancel_request, generate, get_request
-from app.models import AIControlOutboxModel, AIEventOutboxModel, AIRequestModel, AIRequestMutationModel
+from app.models import (
+    AIControlOutboxModel,
+    AIEventOutboxModel,
+    AIRequestEventModel,
+    AIRequestModel,
+    AIRequestMutationModel,
+)
 from app.middleware_client import MiddlewareOperation
 from app.event_worker import run_once
 from app.control_worker import claim_one as claim_control_one
@@ -271,6 +277,13 @@ async def test_non_cancellation_terminal_middleware_state_requires_reconciliatio
         row = await session.get(AIRequestModel, request_id)
         assert row.status == "reconciliation_required"
         assert row.cancelled_at is None
+        event = await session.scalar(
+            select(AIRequestEventModel)
+            .where(AIRequestEventModel.request_id == request_id)
+            .order_by(AIRequestEventModel.id.desc())
+        )
+        assert event is not None
+        assert event.event_type == "ai.middleware_cancellation_reconciliation_required"
     await engine.dispose()
 
 

@@ -41,3 +41,17 @@ def test_request_list_filters_are_declared_in_runtime_and_source_contracts():
     parameters = app.openapi()["paths"]["/v1/ai/requests"]["get"]["parameters"]
     names = {parameter["name"] for parameter in parameters}
     assert {"cursor", "limit", "status", "task"} <= names
+
+
+def test_source_contract_declares_paged_request_list_response():
+    import yaml
+    from pathlib import Path
+
+    document = yaml.safe_load((Path(__file__).parents[1] / "contracts/openapi.v1.yaml").read_text())
+    schema = document["paths"]["/v1/ai/requests"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
+    assert schema == {"$ref": "#/components/schemas/PagedRequests"}
+    assert document["components"]["schemas"]["PagedRequests"]["properties"]["items"]["items"] == {
+        "$ref": "#/components/schemas/GenerationResponse"
+    }

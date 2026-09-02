@@ -35,6 +35,7 @@ components:
               - ai.middleware_operation_accepted_after_cancellation
               - ai.middleware_idempotency_mismatch
               - ai.middleware_cancellation_accepted
+              - ai.middleware_cancellation_reconciliation_required
               - ai.middleware_cancellation_failed
               - ai.request.cancellation_requested
           request_id: {type: string, format: uuid}
