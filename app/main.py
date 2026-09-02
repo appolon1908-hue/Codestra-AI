@@ -6,13 +6,14 @@ import json
 import os
 import re
 import time
-from datetime import UTC, datetime, timedelta
-from enum import StrEnum
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Security, status
 from fastapi.responses import JSONResponse, Response
+from fastapi.security import HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -34,7 +35,7 @@ from .metrics import (
     render_metrics,
 )
 from .middleware_client import MiddlewareAIClient, MiddlewareSubmissionError
-from .models import AIRequestEventModel, AIRequestModel
+from .models import AIRequestEventModel, AIRequestModel, AIRequestMutationModel
 from .providers.router import ROUTES, resolve_route
 
 SERVICE = "codestra-ai"
@@ -54,15 +55,20 @@ DEPLOYMENT_ID = os.getenv("CODESTRA_DEPLOYMENT_ID", "unassigned")
 CORRELATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,179}$")
 
 app = FastAPI(title="Codestra AI Gateway", version=API_VERSION)
-router = APIRouter(prefix="/v1/ai", tags=["ai"])
+bearer_contract = HTTPBearer(auto_error=False)
+router = APIRouter(prefix="/v1/ai", tags=["ai"], dependencies=[Security(bearer_contract)])
 
 TenantHeader = Annotated[str, Header(alias="X-Tenant-ID", min_length=1, max_length=128)]
 IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
 CorrelationHeader = Annotated[str | None, Header(alias="X-Correlation-ID", max_length=180)]
-ActorHeader = Annotated[str | None, Header(alias="X-Codestra-Actor", max_length=160)]
+ALLOWED_REGIONS = frozenset({"global"})
+BOUNDED_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"})
 
 
-class TaskType(StrEnum):
+UTC = timezone.utc
+
+
+class TaskType(str, Enum):
     COPY = "copy"
     CLASSIFY = "classify"
     SUMMARIZE = "summarize"
@@ -221,12 +227,13 @@ async def security_observability_boundary(request: Request, call_next):
             retryable=True,
         )
     operation = _operation(request)
+    metric_method = request.method if request.method in BOUNDED_METHODS else "OTHER"
     REQUESTS.labels(
         operation=operation,
-        method=request.method,
+        method=metric_method,
         status_class=f"{response.status_code // 100}xx",
     ).inc()
-    DURATION.labels(operation=operation, method=request.method).observe(
+    DURATION.labels(operation=operation, method=metric_method).observe(
         time.perf_counter() - started
     )
     response.headers["X-Correlation-ID"] = request.state.correlation_id
@@ -435,11 +442,18 @@ async def generate(
     idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
     x_correlation_id: CorrelationHeader = None,
-    x_codestra_actor: ActorHeader = None,
+    request: Request = None,
 ) -> GenerationResponse:
     tenant_id = _tenant(x_tenant_id, body.tenant_id)
     correlation_id = x_correlation_id or str(uuid4())
-    actor_id = x_codestra_actor or "codestra-ai-api"
+    actor_id = (
+        request.state.auth.subject
+        if request is not None and hasattr(request.state, "auth")
+        else "codestra-ai-internal"
+    )
+    if body.region not in ALLOWED_REGIONS:
+        POLICY_DENIALS.labels(reason="region_not_allowed").inc()
+        raise HTTPException(status_code=403, detail="region_not_allowed")
     input_digest, fingerprint = _fingerprint(tenant_id, body)
     existing = await session.execute(
         select(AIRequestModel).where(
@@ -448,55 +462,57 @@ async def generate(
         )
     )
     row = existing.scalar_one_or_none()
+    provider_enabled = EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
     if row is not None:
         if row.request_fingerprint != fingerprint:
             IDEMPOTENCY_CONFLICTS.inc()
             raise HTTPException(status_code=409, detail="idempotency_conflict")
-        return _response(row)
-
-    provider_enabled = EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE
-    route = resolve_route(body.task.value)
-    row = AIRequestModel(
-        id=uuid4(),
-        tenant_id=tenant_id,
-        task=body.task.value,
-        provider=route.provider.value,
-        model=route.model,
-        status="queued" if provider_enabled else "blocked_by_capability",
-        input_digest=input_digest,
-        idempotency_key=idempotency_key,
-        request_fingerprint=fingerprint,
-    )
-    session.add(row)
-    try:
-        await session.flush()
-        await _event(
-            session,
-            row,
-            event_type="ai.request.accepted",
-            previous_status=None,
-            actor_id=actor_id,
-            safe_detail=(
-                "submitted_for_middleware_dispatch"
-                if provider_enabled
-                else "external_model_calls_disabled"
-            ),
+        if row.status != "dispatch_pending":
+            return _response(row)
+    else:
+        route = resolve_route(body.task.value)
+        row = AIRequestModel(
+            id=uuid4(),
+            tenant_id=tenant_id,
+            task=body.task.value,
+            provider=route.provider.value,
+            model=route.model,
+            status="dispatch_pending" if provider_enabled else "blocked_by_capability",
+            input_digest=input_digest,
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
         )
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        result = await session.execute(
-            select(AIRequestModel).where(
-                AIRequestModel.tenant_id == tenant_id,
-                AIRequestModel.idempotency_key == idempotency_key,
+        session.add(row)
+        try:
+            await session.flush()
+            await _event(
+                session,
+                row,
+                event_type="ai.request.accepted",
+                previous_status=None,
+                actor_id=actor_id,
+                safe_detail=(
+                    "submitted_for_middleware_dispatch"
+                    if provider_enabled
+                    else "external_model_calls_disabled"
+                ),
             )
-        )
-        row = result.scalar_one_or_none()
-        if row is None or row.request_fingerprint != fingerprint:
-            IDEMPOTENCY_CONFLICTS.inc()
-            raise HTTPException(status_code=409, detail="idempotency_conflict")
-        return _response(row)
-    await session.refresh(row)
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            result = await session.execute(
+                select(AIRequestModel).where(
+                    AIRequestModel.tenant_id == tenant_id,
+                    AIRequestModel.idempotency_key == idempotency_key,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None or row.request_fingerprint != fingerprint:
+                IDEMPOTENCY_CONFLICTS.inc()
+                raise HTTPException(status_code=409, detail="idempotency_conflict")
+            if row.status != "dispatch_pending":
+                return _response(row)
+        await session.refresh(row)
 
     if not provider_enabled:
         POLICY_DENIALS.labels(reason="capability_disabled").inc()
@@ -509,6 +525,7 @@ async def generate(
                 "task": row.task,
                 "provider": row.provider,
                 "model": row.model,
+                "input": body.input,
                 "input_digest": row.input_digest,
                 "campaign_id": body.campaign_id,
                 "data_class": body.data_class,
@@ -660,9 +677,34 @@ async def cancel_request(
     x_tenant_id: TenantHeader,
     idempotency_key: IdempotencyHeader,
     session: AsyncSession = Depends(get_session),
-    x_codestra_actor: ActorHeader = None,
+    request: Request = None,
 ) -> GenerationResponse:
-    del idempotency_key
+    fingerprint = hashlib.sha256(
+        json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    replay = await session.execute(
+        select(AIRequestMutationModel).where(
+            AIRequestMutationModel.tenant_id == x_tenant_id,
+            AIRequestMutationModel.request_id == request_id,
+            AIRequestMutationModel.mutation_type == "cancel",
+            AIRequestMutationModel.idempotency_key == idempotency_key,
+        )
+    )
+    replay_record = replay.scalar_one_or_none()
+    if replay_record is not None:
+        if replay_record.request_fingerprint != fingerprint:
+            IDEMPOTENCY_CONFLICTS.inc()
+            raise HTTPException(status_code=409, detail="idempotency_conflict")
+        replay_row = await session.execute(
+            select(AIRequestModel).where(
+                AIRequestModel.id == request_id,
+                AIRequestModel.tenant_id == x_tenant_id,
+            )
+        )
+        row = replay_row.scalar_one_or_none()
+        if row is None:
+            raise HTTPException(status_code=404, detail="ai_request_not_found")
+        return _response(row)
     result = await session.execute(
         select(AIRequestModel)
         .where(AIRequestModel.id == request_id, AIRequestModel.tenant_id == x_tenant_id)
@@ -679,12 +721,26 @@ async def cancel_request(
     row.status = "cancellation_pending" if row.middleware_operation_id else "cancelled"
     row.cancelled_at = datetime.now(UTC) if row.status == "cancelled" else None
     row.resource_version += 1
+    session.add(
+        AIRequestMutationModel(
+            tenant_id=x_tenant_id,
+            request_id=request_id,
+            mutation_type="cancel",
+            idempotency_key=idempotency_key,
+            request_fingerprint=fingerprint,
+            result_version=row.resource_version,
+        )
+    )
     await _event(
         session,
         row,
         event_type="ai.request.cancellation_requested",
         previous_status=previous,
-        actor_id=x_codestra_actor or "codestra-ai-api",
+        actor_id=(
+            request.state.auth.subject
+            if request is not None and hasattr(request.state, "auth")
+            else "codestra-ai-internal"
+        ),
         safe_detail=body.reason,
     )
     await session.commit()

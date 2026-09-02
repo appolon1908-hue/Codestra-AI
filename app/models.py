@@ -57,3 +57,32 @@ class AIRequestEventModel(Base):
             name="fk_ai_request_event_request",
         ),
     )
+
+
+class AIRequestMutationModel(Base):
+    __tablename__ = "ai_request_mutations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    mutation_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(200), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["tenant_id", "request_id"],
+            ["ai_requests.tenant_id", "ai_requests.id"],
+            ondelete="CASCADE",
+            name="fk_ai_request_mutation_request",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "request_id",
+            "mutation_type",
+            "idempotency_key",
+            name="uq_ai_request_mutation_idempotency",
+        ),
+    )

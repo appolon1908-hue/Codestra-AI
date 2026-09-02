@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -47,7 +48,17 @@ class MiddlewareAIClient:
         correlation_id: str,
         idempotency_key: str,
     ) -> MiddlewareOperation:
-        if not self.base_url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
+        parsed = urlsplit(self.base_url)
+        is_https = parsed.scheme == "https"
+        is_loopback_http = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+        if (
+            not (is_https or is_loopback_http)
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
             raise MiddlewareSubmissionError("middleware_base_url_invalid")
         headers = {
             "Authorization": f"Bearer {self._token()}",

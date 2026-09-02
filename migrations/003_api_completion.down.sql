@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS ai_request_mutations;
 DROP TABLE IF EXISTS ai_request_events;
 DROP INDEX IF EXISTS ix_ai_requests_middleware_operation_id;
 DROP INDEX IF EXISTS uq_ai_request_tenant_id;

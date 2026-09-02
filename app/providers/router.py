@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from enum import StrEnum
+from enum import Enum
 
-class ProviderName(StrEnum):
+class ProviderName(str, Enum):
     OPENAI = "openai"
 
 @dataclass(frozen=True)

@@ -27,3 +27,9 @@ def test_api_completion_contract_has_governed_routes():
 def test_effects_remain_disabled_and_dev_bypass_is_bounded():
     assert EXTERNAL_MODEL_CALLS_ENABLED is False
     assert APP_ENV in {"development", "test"} or ALLOW_DEV_AUTH_BYPASS is False
+
+
+def test_runtime_openapi_declares_bearer_security_for_protected_routes():
+    document = app.openapi()
+    assert "HTTPBearer" in document["components"]["securitySchemes"]
+    assert document["paths"]["/v1/ai/generate"]["post"]["security"] == [{"HTTPBearer": []}]
