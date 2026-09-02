@@ -89,6 +89,17 @@ async def test_authentication_error_preserves_bearer_challenge():
 
 
 @pytest.mark.asyncio
+async def test_whitespace_tenant_alias_is_rejected_before_handler():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/ai/requests",
+            headers={"X-Tenant-ID": " tenant-1 "},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_tenant_header"
+
+
+@pytest.mark.asyncio
 async def test_remote_protocol_failure_is_an_unknown_outcome(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("MIDDLEWARE_BASE_URL", "https://middleware.example")
     client = MiddlewareAIClient()

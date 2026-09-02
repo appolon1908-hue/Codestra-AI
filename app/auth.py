@@ -104,7 +104,10 @@ async def authenticate(
     required_scope: str,
     tenant_required: bool = True,
 ) -> AuthContext:
-    tenant_id = request.headers.get("X-Tenant-ID", "").strip()
+    raw_tenant_id = request.headers.get("X-Tenant-ID", "")
+    tenant_id = raw_tenant_id.strip()
+    if raw_tenant_id != tenant_id:
+        raise HTTPException(status_code=400, detail="invalid_tenant_header")
     authorization = request.headers.get("Authorization", "").strip()
 
     if not authorization:

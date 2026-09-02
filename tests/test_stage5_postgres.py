@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.main import CancelRequest, GenerationRequest, TaskType, cancel_request, generate, get_request
 from app.models import AIControlOutboxModel, AIEventOutboxModel, AIRequestModel, AIRequestMutationModel
+from app.middleware_client import MiddlewareOperation
 from app.event_worker import run_once
 from app.control_worker import claim_one as claim_control_one
 from app.control_worker import complete as complete_control
@@ -177,6 +178,7 @@ async def test_queued_cancellation_is_dispatched_durably_once():
             self.calls += 1
             assert operation_id == "middleware-operation-1"
             assert kwargs["reason"] == "Customer’s request / duplicate"
+            return MiddlewareOperation(operation_id, "cancelled", None)
 
     client = Client()
     assert await run_control_once(
@@ -239,6 +241,40 @@ async def test_unknown_submission_cancellation_preserves_reconciliation_state():
 
 
 @pytest.mark.asyncio
+async def test_nonterminal_middleware_cancellation_requires_reconciliation():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-control-pending-{uuid.uuid4()}"
+    request_id = uuid.uuid4()
+    async with sessions() as session:
+        session.add(
+            AIRequestModel(
+                id=request_id, tenant_id=tenant_id, task="summarize", status="queued",
+                input_digest="0" * 64, idempotency_key=f"request-{uuid.uuid4()}",
+                request_fingerprint="1" * 64, middleware_operation_id="operation-pending",
+                resource_version=1,
+            )
+        )
+        await session.commit()
+    async with sessions() as session:
+        await cancel_request(
+            request_id, CancelRequest(expected_version=1, reason="pending test"),
+            tenant_id, f"cancel-{uuid.uuid4()}", session,
+        )
+
+    class Client:
+        async def cancel(self, operation_id, **_kwargs):
+            return MiddlewareOperation(operation_id, "cancellation_pending", None)
+
+    assert await run_control_once(Client(), lease_seconds=30, max_attempts=3, session_factory=sessions)
+    async with sessions() as session:
+        row = await session.get(AIRequestModel, request_id)
+        assert row.status == "reconciliation_required"
+        assert row.cancelled_at is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_expired_control_claim_cannot_complete_a_newer_lease():
     engine = create_async_engine(os.environ["DATABASE_URL"])
     sessions = async_sessionmaker(engine, expire_on_commit=False)
@@ -267,13 +303,13 @@ async def test_expired_control_claim_cannot_complete_a_newer_lease():
         await session.commit()
     second = await claim_control_one(30, session_factory=sessions)
     assert second is not None and second.attempts == first.attempts + 1
-    await complete_control(first, session_factory=sessions)
+    await complete_control(first, "cancelled", session_factory=sessions)
     async with sessions() as session:
         outbox = await session.get(AIControlOutboxModel, first.id)
         request_row = await session.get(AIRequestModel, request_id)
         assert outbox.state == "processing"
         assert request_row.status == "cancellation_pending"
-    await complete_control(second, session_factory=sessions)
+    await complete_control(second, "cancelled", session_factory=sessions)
     async with sessions() as session:
         request_row = await session.get(AIRequestModel, request_id)
         assert request_row.status == "cancelled"

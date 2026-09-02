@@ -79,7 +79,12 @@ async def _record_event(session, request: AIRequestModel, kind: str, previous: s
     )
 
 
-async def complete(claim: Claim, *, session_factory=SessionLocal) -> None:
+async def complete(
+    claim: Claim,
+    middleware_state: str,
+    *,
+    session_factory=SessionLocal,
+) -> None:
     async with session_factory() as session:
         row = await session.scalar(
             select(AIControlOutboxModel).where(AIControlOutboxModel.id == claim.id).with_for_update()
@@ -94,14 +99,24 @@ async def complete(claim: Claim, *, session_factory=SessionLocal) -> None:
         if request is None:
             return
         previous = request.status
-        if previous == "cancellation_pending":
+        terminal = middleware_state.lower() in {"cancelled", "canceled", "completed", "succeeded"}
+        if previous == "cancellation_pending" and terminal:
             request.status = "cancelled"
             request.cancelled_at = datetime.now(UTC)
+            request.resource_version += 1
+        elif previous == "cancellation_pending":
+            request.status = "reconciliation_required"
             request.resource_version += 1
         row.state = "completed"
         row.completed_at = datetime.now(UTC)
         row.lease_until = None
-        await _record_event(session, request, "ai.middleware_cancellation_accepted", previous, "cancelled")
+        await _record_event(
+            session,
+            request,
+            "ai.middleware_cancellation_accepted",
+            previous,
+            "cancelled" if terminal else f"nonterminal:{middleware_state[:64]}",
+        )
         await session.commit()
 
 
@@ -140,7 +155,7 @@ async def run_once(client: MiddlewareAIClient, *, lease_seconds: int, max_attemp
         return False
     payload = item.payload
     try:
-        await client.cancel(
+        operation = await client.cancel(
             payload["middleware_operation_id"],
             request_id=payload["request_id"],
             tenant_id=payload["tenant_id"],
@@ -151,7 +166,7 @@ async def run_once(client: MiddlewareAIClient, *, lease_seconds: int, max_attemp
     except MiddlewareSubmissionError as exc:
         await fail(item, exc, max_attempts, session_factory=session_factory)
     else:
-        await complete(item, session_factory=session_factory)
+        await complete(item, operation.state, session_factory=session_factory)
     return True
 
 
