@@ -31,6 +31,7 @@ components:
               - ai.request.accepted
               - ai.middleware_operation_accepted
               - ai.middleware_submission_failed
+              - ai.middleware_submission_failed_after_state_change
               - ai.middleware_operation_accepted_after_cancellation
               - ai.request.cancellation_requested
           request_id: {type: string, format: uuid}

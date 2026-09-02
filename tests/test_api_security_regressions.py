@@ -70,3 +70,36 @@ async def test_validation_errors_use_the_safe_error_envelope():
         )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "request_validation_failed"
+
+
+@pytest.mark.asyncio
+async def test_authentication_error_preserves_bearer_challenge():
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(
+            "/v1/ai/requests",
+            headers={"X-Tenant-ID": "tenant-1", "Authorization": "Basic invalid"},
+        )
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+@pytest.mark.asyncio
+async def test_remote_protocol_failure_is_an_unknown_outcome(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIDDLEWARE_BASE_URL", "https://middleware.example")
+    client = MiddlewareAIClient()
+    monkeypatch.setattr(client, "_token", lambda: "synthetic-token")
+
+    class BrokenClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            raise httpx.RemoteProtocolError("synthetic protocol failure")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: BrokenClient())
+    with pytest.raises(MiddlewareSubmissionError) as failure:
+        await client.submit({}, tenant_id="tenant-1", correlation_id="correlation-1", idempotency_key="request-key")
+    assert failure.value.outcome_unknown is True

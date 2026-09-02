@@ -143,6 +143,7 @@ def _error(
     code: str,
     message: str,
     retryable: bool = False,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     correlation_id = getattr(request.state, "correlation_id", str(uuid4()))
     return JSONResponse(
@@ -156,7 +157,11 @@ def _error(
                 "details": {},
             }
         },
-        headers={"X-Correlation-ID": correlation_id, "Cache-Control": "no-store"},
+        headers={
+            **(headers or {}),
+            "X-Correlation-ID": correlation_id,
+            "Cache-Control": "no-store",
+        },
     )
 
 
@@ -168,6 +173,7 @@ async def http_exception_handler(request: Request, exc: HTTPException) -> JSONRe
         code=str(exc.detail),
         message="request could not be completed",
         retryable=exc.status_code >= 500,
+        headers=exc.headers,
     )
 
 
@@ -229,6 +235,7 @@ async def security_observability_boundary(request: Request, call_next):
                 status_code=exc.status_code,
                 code=reason,
                 message="request authorization failed",
+                headers=exc.headers,
             )
     started = time.perf_counter()
     try:
@@ -579,13 +586,26 @@ async def generate(
             idempotency_key=idempotency_key,
         )
     except MiddlewareSubmissionError as exc:
+        locked_result = await session.execute(
+            select(AIRequestModel)
+            .where(AIRequestModel.id == row.id, AIRequestModel.tenant_id == tenant_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = locked_result.scalar_one()
         previous = row.status
-        row.status = "reconciliation_required" if exc.outcome_unknown else "failed"
-        row.resource_version += 1
+        transition_allowed = row.status == "dispatch_pending"
+        if transition_allowed:
+            row.status = "reconciliation_required" if exc.outcome_unknown else "failed"
+            row.resource_version += 1
         await _event(
             session,
             row,
-            event_type="ai.middleware_submission_failed",
+            event_type=(
+                "ai.middleware_submission_failed"
+                if transition_allowed
+                else "ai.middleware_submission_failed_after_state_change"
+            ),
             previous_status=previous,
             actor_id=actor_id,
             safe_detail=exc.code,

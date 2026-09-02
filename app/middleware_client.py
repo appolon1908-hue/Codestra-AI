@@ -74,7 +74,7 @@ class MiddlewareAIClient:
                     headers=headers,
                     json=payload,
                 )
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
             raise MiddlewareSubmissionError(
                 "middleware_submission_outcome_unknown",
                 outcome_unknown=True,
