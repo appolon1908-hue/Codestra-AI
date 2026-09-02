@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi import HTTPException
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.main import CancelRequest, GenerationRequest, TaskType, cancel_request, generate, get_request
 from app.models import AIControlOutboxModel, AIEventOutboxModel, AIRequestModel, AIRequestMutationModel
 from app.event_worker import run_once
+from app.control_worker import claim_one as claim_control_one
+from app.control_worker import complete as complete_control
 from app.control_worker import run_once as run_control_once
 
 pytestmark = pytest.mark.postgres
@@ -232,4 +235,46 @@ async def test_unknown_submission_cancellation_preserves_reconciliation_state():
                 AIControlOutboxModel.request_id == request_id
             )
         ) == 0
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expired_control_claim_cannot_complete_a_newer_lease():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-control-lease-{uuid.uuid4()}"
+    request_id = uuid.uuid4()
+    async with sessions() as session:
+        session.add(
+            AIRequestModel(
+                id=request_id, tenant_id=tenant_id, task="summarize", status="queued",
+                input_digest="0" * 64, idempotency_key=f"request-{uuid.uuid4()}",
+                request_fingerprint="1" * 64, middleware_operation_id="operation-lease",
+                resource_version=1,
+            )
+        )
+        await session.commit()
+    async with sessions() as session:
+        await cancel_request(
+            request_id, CancelRequest(expected_version=1, reason="lease test"),
+            tenant_id, f"cancel-{uuid.uuid4()}", session,
+        )
+    first = await claim_control_one(30, session_factory=sessions)
+    assert first is not None
+    async with sessions() as session:
+        outbox = await session.get(AIControlOutboxModel, first.id)
+        outbox.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        await session.commit()
+    second = await claim_control_one(30, session_factory=sessions)
+    assert second is not None and second.attempts == first.attempts + 1
+    await complete_control(first, session_factory=sessions)
+    async with sessions() as session:
+        outbox = await session.get(AIControlOutboxModel, first.id)
+        request_row = await session.get(AIRequestModel, request_id)
+        assert outbox.state == "processing"
+        assert request_row.status == "cancellation_pending"
+    await complete_control(second, session_factory=sessions)
+    async with sessions() as session:
+        request_row = await session.get(AIRequestModel, request_id)
+        assert request_row.status == "cancelled"
     await engine.dispose()

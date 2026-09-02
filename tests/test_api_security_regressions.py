@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import json
+
 import pytest
 import httpx
 from fastapi import HTTPException
@@ -114,6 +117,7 @@ async def test_remote_protocol_failure_is_an_unknown_outcome(monkeypatch: pytest
         {"operation_id": None, "state": None},
         {"operation_id": "", "state": "accepted"},
         {"operation_id": "operation-1", "state": ""},
+        {"operation_id": "x" * 129, "state": "accepted"},
     ],
 )
 async def test_middleware_rejects_null_or_empty_operation_identity(
@@ -165,3 +169,47 @@ def test_every_malformed_cursor_is_a_safe_client_error(cursor: str):
         _decode_cursor(cursor)
     assert invalid.value.status_code == 400
     assert invalid.value.detail == "invalid_cursor"
+
+
+def test_timezone_naive_cursor_is_a_safe_client_error():
+    value = base64.urlsafe_b64encode(
+        json.dumps(["2026-09-02T12:00:00", "00000000-0000-0000-0000-000000000001"]).encode()
+    ).decode().rstrip("=")
+    with pytest.raises(HTTPException) as invalid:
+        _decode_cursor(value)
+    assert invalid.value.status_code == 400
+    assert invalid.value.detail == "invalid_cursor"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_rejection_is_explicitly_retryable(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("MIDDLEWARE_BASE_URL", "https://middleware.example")
+    client = MiddlewareAIClient()
+    monkeypatch.setattr(client, "_token", lambda: "synthetic-token")
+
+    class Response:
+        status_code = 429
+
+    class StubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: StubClient())
+    with pytest.raises(MiddlewareSubmissionError) as failure:
+        await client.submit({}, tenant_id="tenant-1", correlation_id="correlation-1", idempotency_key="request-key")
+    assert failure.value.retryable is True
+    assert failure.value.outcome_unknown is False
+
+
+def test_runtime_openapi_publishes_oauth_client_credentials_and_scopes():
+    document = app.openapi()
+    scheme = document["components"]["securitySchemes"]["serviceBearer"]
+    assert "clientCredentials" in scheme["flows"]
+    assert "ai.request" in document["paths"]["/v1/ai/generate"]["post"]["security"][0]["serviceBearer"]
+    assert "ai.cancel" in document["paths"]["/v1/ai/requests/{request_id}/cancel"]["post"]["security"][0]["serviceBearer"]

@@ -15,7 +15,8 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Security, status
 from fastapi.responses import JSONResponse, Response
-from fastapi.security import HTTPBearer
+from fastapi.openapi.models import OAuthFlowClientCredentials, OAuthFlows
+from fastapi.security import OAuth2
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, or_, select
@@ -64,8 +65,22 @@ DEPLOYMENT_ID = os.getenv("CODESTRA_DEPLOYMENT_ID", "unassigned")
 CORRELATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,179}$")
 
 app = FastAPI(title="Codestra AI Gateway", version=API_VERSION)
-bearer_contract = HTTPBearer(auto_error=False)
-router = APIRouter(prefix="/v1/ai", tags=["ai"], dependencies=[Security(bearer_contract)])
+bearer_contract = OAuth2(
+    flows=OAuthFlows(
+        clientCredentials=OAuthFlowClientCredentials(
+            tokenUrl=f"{os.getenv('KEYCLOAK_ISSUER', 'https://auth.codestra.co/realms/codestra').rstrip('/')}/protocol/openid-connect/token",
+            scopes={
+                "ai.read": "Read governed AI resources",
+                "ai.request": "Submit governed AI requests",
+                "ai.cancel": "Cancel governed AI requests",
+                "metrics.read": "Read private service metrics",
+            },
+        )
+    ),
+    scheme_name="serviceBearer",
+    auto_error=False,
+)
+router = APIRouter(prefix="/v1/ai", tags=["ai"])
 
 TenantHeader = Annotated[str, Header(alias="X-Tenant-ID", min_length=1, max_length=128)]
 IdempotencyHeader = Annotated[str, Header(alias="Idempotency-Key", min_length=8, max_length=200)]
@@ -371,7 +386,10 @@ def _decode_cursor(value: str | None) -> tuple[datetime, UUID] | None:
         created_at, identity = json.loads(
             base64.urlsafe_b64decode(value + padding).decode("utf-8")
         )
-        return datetime.fromisoformat(created_at), UUID(identity)
+        timestamp = datetime.fromisoformat(created_at)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("cursor timestamp must include a UTC offset")
+        return timestamp, UUID(identity)
     except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="invalid_cursor") from exc
 
@@ -422,7 +440,7 @@ def version() -> dict[str, object]:
     }
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Security(bearer_contract, scopes=["metrics.read"])])
 def metrics() -> Response:
     CAPABILITY.labels(capability="external_model_calls").set(
         1 if EXTERNAL_MODEL_CALLS_ENABLED and EXTERNAL_MODEL_EXECUTION_AVAILABLE else 0
@@ -451,7 +469,7 @@ def capabilities() -> dict[str, object]:
     }
 
 
-@router.get("/models")
+@router.get("/models", dependencies=[Security(bearer_contract, scopes=["ai.read"])])
 def models(x_tenant_id: TenantHeader) -> dict[str, object]:
     items = [
         {
@@ -467,7 +485,7 @@ def models(x_tenant_id: TenantHeader) -> dict[str, object]:
     return {"items": items, "next_cursor": None}
 
 
-@router.get("/policies")
+@router.get("/policies", dependencies=[Security(bearer_contract, scopes=["ai.read"])])
 def policies(x_tenant_id: TenantHeader) -> dict[str, object]:
     return {
         "items": [
@@ -486,7 +504,12 @@ def policies(x_tenant_id: TenantHeader) -> dict[str, object]:
     }
 
 
-@router.post("/generate", response_model=GenerationResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/generate",
+    response_model=GenerationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Security(bearer_contract, scopes=["ai.request"])],
+)
 async def generate(
     body: GenerationRequest,
     x_tenant_id: TenantHeader,
@@ -601,7 +624,13 @@ async def generate(
             exc.outcome_unknown and row.middleware_operation_id is None
         )
         if transition_allowed:
-            row.status = "reconciliation_required" if exc.outcome_unknown else "failed"
+            row.status = (
+                "reconciliation_required"
+                if exc.outcome_unknown
+                else "dispatch_pending"
+                if exc.retryable
+                else "failed"
+            )
             row.resource_version += 1
         await _event(
             session,
@@ -676,7 +705,11 @@ async def generate(
     return _response(row)
 
 
-@router.get("/requests", response_model=PagedRequests)
+@router.get(
+    "/requests",
+    response_model=PagedRequests,
+    dependencies=[Security(bearer_contract, scopes=["ai.read"])],
+)
 async def list_requests(
     x_tenant_id: TenantHeader,
     limit: int = Query(default=50, ge=1, le=100),
@@ -710,7 +743,11 @@ async def list_requests(
     return PagedRequests(items=[_response(row) for row in items], next_cursor=next_cursor)
 
 
-@router.get("/requests/{request_id}", response_model=GenerationResponse)
+@router.get(
+    "/requests/{request_id}",
+    response_model=GenerationResponse,
+    dependencies=[Security(bearer_contract, scopes=["ai.read"])],
+)
 async def get_request(
     request_id: UUID,
     x_tenant_id: TenantHeader,
@@ -728,7 +765,11 @@ async def get_request(
     return _response(row)
 
 
-@router.get("/requests/{request_id}/events", response_model=PagedEvents)
+@router.get(
+    "/requests/{request_id}/events",
+    response_model=PagedEvents,
+    dependencies=[Security(bearer_contract, scopes=["ai.read"])],
+)
 async def get_request_events(
     request_id: UUID,
     x_tenant_id: TenantHeader,
@@ -770,7 +811,11 @@ async def get_request_events(
     )
 
 
-@router.post("/requests/{request_id}/cancel", response_model=GenerationResponse)
+@router.post(
+    "/requests/{request_id}/cancel",
+    response_model=GenerationResponse,
+    dependencies=[Security(bearer_contract, scopes=["ai.cancel"])],
+)
 async def cancel_request(
     request_id: UUID,
     body: CancelRequest,
@@ -875,7 +920,7 @@ async def cancel_request(
     return _response(row)
 
 
-@router.get("/usage")
+@router.get("/usage", dependencies=[Security(bearer_contract, scopes=["ai.read"])])
 async def usage(
     x_tenant_id: TenantHeader,
     days: int = Query(default=30, ge=1, le=366),

@@ -10,10 +10,17 @@ import httpx
 
 
 class MiddlewareSubmissionError(RuntimeError):
-    def __init__(self, code: str, *, outcome_unknown: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        outcome_unknown: bool = False,
+        retryable: bool = False,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.outcome_unknown = outcome_unknown
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -78,18 +85,24 @@ class MiddlewareAIClient:
             raise MiddlewareSubmissionError(
                 "middleware_submission_outcome_unknown",
                 outcome_unknown=True,
+                retryable=True,
             ) from exc
         if response.status_code not in {200, 202}:
             raise MiddlewareSubmissionError(
                 f"middleware_rejected_{response.status_code}",
                 outcome_unknown=response.status_code >= 500,
+                retryable=response.status_code in {408, 425, 429} or response.status_code >= 500,
             )
         try:
             document = response.json()
             operation_id_value = document["operation_id"]
             state_value = document["state"]
-            if not isinstance(operation_id_value, str) or not operation_id_value.strip():
-                raise TypeError("operation_id must be a nonempty string")
+            if (
+                not isinstance(operation_id_value, str)
+                or not operation_id_value.strip()
+                or len(operation_id_value.strip()) > 128
+            ):
+                raise TypeError("operation_id must be a persistable nonempty string")
             if not isinstance(state_value, str) or not state_value.strip():
                 raise TypeError("state must be a nonempty string")
             operation_id = operation_id_value.strip()
@@ -98,6 +111,7 @@ class MiddlewareAIClient:
             raise MiddlewareSubmissionError(
                 "middleware_response_invalid",
                 outcome_unknown=True,
+                retryable=True,
             ) from exc
         return MiddlewareOperation(
             operation_id=operation_id,
@@ -145,12 +159,15 @@ class MiddlewareAIClient:
                 )
         except httpx.TransportError as exc:
             raise MiddlewareSubmissionError(
-                "middleware_cancellation_outcome_unknown", outcome_unknown=True
+                "middleware_cancellation_outcome_unknown",
+                outcome_unknown=True,
+                retryable=True,
             ) from exc
         if response.status_code not in {200, 202}:
             raise MiddlewareSubmissionError(
                 f"middleware_cancellation_rejected_{response.status_code}",
                 outcome_unknown=response.status_code >= 500,
+                retryable=response.status_code in {408, 425, 429} or response.status_code >= 500,
             )
         try:
             document = response.json()

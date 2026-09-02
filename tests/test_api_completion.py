@@ -31,5 +31,7 @@ def test_effects_remain_disabled_and_dev_bypass_is_bounded():
 
 def test_runtime_openapi_declares_bearer_security_for_protected_routes():
     document = app.openapi()
-    assert "HTTPBearer" in document["components"]["securitySchemes"]
-    assert document["paths"]["/v1/ai/generate"]["post"]["security"] == [{"HTTPBearer": []}]
+    assert "serviceBearer" in document["components"]["securitySchemes"]
+    assert document["paths"]["/v1/ai/generate"]["post"]["security"] == [
+        {"serviceBearer": ["ai.request"]}
+    ]

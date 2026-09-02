@@ -84,7 +84,7 @@ async def complete(claim: Claim, *, session_factory=SessionLocal) -> None:
         row = await session.scalar(
             select(AIControlOutboxModel).where(AIControlOutboxModel.id == claim.id).with_for_update()
         )
-        if row is None or row.state != "processing":
+        if row is None or row.state != "processing" or row.attempts != claim.attempts:
             return
         request = await session.scalar(
             select(AIRequestModel).where(
@@ -112,7 +112,7 @@ async def fail(
         row = await session.scalar(
             select(AIControlOutboxModel).where(AIControlOutboxModel.id == claim.id).with_for_update()
         )
-        if row is None or row.state != "processing":
+        if row is None or row.state != "processing" or row.attempts != claim.attempts:
             return
         request = await session.scalar(
             select(AIRequestModel).where(
@@ -121,7 +121,7 @@ async def fail(
         )
         if request is None:
             return
-        terminal = not error.outcome_unknown or claim.attempts >= max_attempts
+        terminal = not error.retryable or claim.attempts >= max_attempts
         row.state = "dead_letter" if terminal else "pending"
         row.available_at = datetime.now(UTC) + timedelta(seconds=min(2 ** min(claim.attempts, 8), 300))
         row.lease_until = None
