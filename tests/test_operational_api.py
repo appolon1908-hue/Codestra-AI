@@ -6,9 +6,8 @@ from app.main import app, capabilities, health, version
 
 
 def test_operational_endpoints_are_attributable_and_fail_closed():
-    assert {"/health", "/ready", "/version", "/capabilities"}.issubset(
-        app.openapi()["paths"]
-    )
+    assert {"/health", "/ready", "/version"}.issubset(app.openapi()["paths"])
+    assert "/capabilities" in {getattr(route, "path", None) for route in app.routes}
     assert health()["service"] == "codestra-ai"
     assert version()["service"] == "codestra-ai"
     value = capabilities()

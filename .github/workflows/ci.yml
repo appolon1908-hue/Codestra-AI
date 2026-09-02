@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
           cache: pip
@@ -22,6 +22,7 @@ jobs:
       - run: pip install -e '.[test]'
       - run: python -m compileall -q app scripts tests
       - run: pytest -q -m 'not postgres'
+      - run: python scripts/validate_api_completion.py
       - run: python -c "from app.main import app, EXTERNAL_MODEL_CALLS_ENABLED; assert app; assert EXTERNAL_MODEL_CALLS_ENABLED is False"
 
   postgres-certification:
@@ -44,10 +45,13 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/codestra_ai_stage5
       POSTGRES_DSN: postgresql://postgres:postgres@127.0.0.1:5432/codestra_ai_stage5
+      CODESTRA_ENVIRONMENT: test
+      ALLOW_DEV_AUTH_BYPASS: 'true'
       EXTERNAL_MODEL_CALLS_ENABLED: 'false'
+      TELEMETRY_EXPORT_ENABLED: 'false'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
           cache: pip
