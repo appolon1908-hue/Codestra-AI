@@ -682,6 +682,16 @@ async def cancel_request(
     fingerprint = hashlib.sha256(
         json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+    result = await session.execute(
+        select(AIRequestModel)
+        .where(AIRequestModel.id == request_id, AIRequestModel.tenant_id == x_tenant_id)
+        .with_for_update()
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="ai_request_not_found")
+    # Check the mutation ledger only after taking the aggregate lock. This makes
+    # simultaneous retries observe the first transaction's committed result.
     replay = await session.execute(
         select(AIRequestMutationModel).where(
             AIRequestMutationModel.tenant_id == x_tenant_id,
@@ -695,24 +705,7 @@ async def cancel_request(
         if replay_record.request_fingerprint != fingerprint:
             IDEMPOTENCY_CONFLICTS.inc()
             raise HTTPException(status_code=409, detail="idempotency_conflict")
-        replay_row = await session.execute(
-            select(AIRequestModel).where(
-                AIRequestModel.id == request_id,
-                AIRequestModel.tenant_id == x_tenant_id,
-            )
-        )
-        row = replay_row.scalar_one_or_none()
-        if row is None:
-            raise HTTPException(status_code=404, detail="ai_request_not_found")
         return _response(row)
-    result = await session.execute(
-        select(AIRequestModel)
-        .where(AIRequestModel.id == request_id, AIRequestModel.tenant_id == x_tenant_id)
-        .with_for_update()
-    )
-    row = result.scalar_one_or_none()
-    if row is None:
-        raise HTTPException(status_code=404, detail="ai_request_not_found")
     if row.resource_version != body.expected_version:
         raise HTTPException(status_code=409, detail="stale_resource_version")
     if row.status in {"completed", "failed", "cancelled"}:
