@@ -9,7 +9,7 @@ from typing import Any
 import jwt
 from fastapi import HTTPException, Request, status
 from jwt import PyJWKClient
-from jwt.exceptions import InvalidTokenError
+from jwt.exceptions import InvalidTokenError, PyJWKClientConnectionError, PyJWKClientError
 
 APP_ENV = os.getenv("CODESTRA_ENVIRONMENT", os.getenv("APP_ENV", "development")).strip().lower()
 ALLOW_DEV_AUTH_BYPASS = (
@@ -81,7 +81,13 @@ async def _decode(token: str) -> dict[str, Any]:
             options={"require": ["exp", "iat", "iss", "sub"]},
             leeway=30,
         )
-    except (InvalidTokenError, ValueError, RuntimeError) as exc:
+    except (
+        InvalidTokenError,
+        PyJWKClientError,
+        PyJWKClientConnectionError,
+        ValueError,
+        RuntimeError,
+    ) as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid_access_token",

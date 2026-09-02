@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 import httpx
 from fastapi import HTTPException
+from jwt.exceptions import PyJWKClientError
 
+from app import auth
 from app.main import GenerationRequest, TaskType, app, generate
 from app.middleware_client import MiddlewareAIClient, MiddlewareSubmissionError
 
@@ -103,3 +105,55 @@ async def test_remote_protocol_failure_is_an_unknown_outcome(monkeypatch: pytest
     with pytest.raises(MiddlewareSubmissionError) as failure:
         await client.submit({}, tenant_id="tenant-1", correlation_id="correlation-1", idempotency_key="request-key")
     assert failure.value.outcome_unknown is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"operation_id": None, "state": None},
+        {"operation_id": "", "state": "accepted"},
+        {"operation_id": "operation-1", "state": ""},
+    ],
+)
+async def test_middleware_rejects_null_or_empty_operation_identity(
+    monkeypatch: pytest.MonkeyPatch, document: dict[str, object]
+):
+    monkeypatch.setenv("MIDDLEWARE_BASE_URL", "https://middleware.example")
+    client = MiddlewareAIClient()
+    monkeypatch.setattr(client, "_token", lambda: "synthetic-token")
+
+    class Response:
+        status_code = 202
+
+        def json(self):
+            return document
+
+    class StubClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: StubClient())
+    with pytest.raises(MiddlewareSubmissionError) as failure:
+        await client.submit({}, tenant_id="tenant-1", correlation_id="correlation-1", idempotency_key="request-key")
+    assert failure.value.outcome_unknown is True
+
+
+@pytest.mark.asyncio
+async def test_jwks_lookup_failure_is_a_safe_authentication_error(monkeypatch: pytest.MonkeyPatch):
+    class BrokenJWKClient:
+        def get_signing_key_from_jwt(self, _token: str):
+            raise PyJWKClientError("synthetic unknown key")
+
+    monkeypatch.setattr(auth, "_jwk_client", lambda: BrokenJWKClient())
+    with pytest.raises(HTTPException) as denied:
+        await auth._decode("synthetic-token")
+    assert denied.value.status_code == 401
+    assert denied.value.detail == "invalid_access_token"
+    assert denied.value.headers == {"WWW-Authenticate": "Bearer"}

@@ -86,8 +86,14 @@ class MiddlewareAIClient:
             )
         try:
             document = response.json()
-            operation_id = str(document["operation_id"])
-            state = str(document["state"])
+            operation_id_value = document["operation_id"]
+            state_value = document["state"]
+            if not isinstance(operation_id_value, str) or not operation_id_value.strip():
+                raise TypeError("operation_id must be a nonempty string")
+            if not isinstance(state_value, str) or not state_value.strip():
+                raise TypeError("state must be a nonempty string")
+            operation_id = operation_id_value.strip()
+            state = state_value.strip()
         except (ValueError, KeyError, TypeError) as exc:
             raise MiddlewareSubmissionError(
                 "middleware_response_invalid",

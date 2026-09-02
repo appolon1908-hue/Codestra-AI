@@ -594,7 +594,9 @@ async def generate(
         )
         row = locked_result.scalar_one()
         previous = row.status
-        transition_allowed = row.status == "dispatch_pending"
+        transition_allowed = row.status == "dispatch_pending" or (
+            exc.outcome_unknown and row.middleware_operation_id is None
+        )
         if transition_allowed:
             row.status = "reconciliation_required" if exc.outcome_unknown else "failed"
             row.resource_version += 1
@@ -627,6 +629,25 @@ async def generate(
     )
     row = locked_result.scalar_one()
     previous = row.status
+    if row.middleware_operation_id is not None and row.status not in {
+        "cancelled",
+        "cancellation_pending",
+    }:
+        if row.middleware_operation_id != operation.operation_id:
+            row.status = "reconciliation_required"
+            row.resource_version += 1
+            await _event(
+                session,
+                row,
+                event_type="ai.middleware_idempotency_mismatch",
+                previous_status=previous,
+                actor_id=actor_id,
+                safe_detail="middleware_operation_identity_changed",
+            )
+            await session.commit()
+            await session.refresh(row)
+            RECONCILIATION.inc()
+        return _response(row)
     row.middleware_operation_id = operation.operation_id
     if row.status in {"cancelled", "cancellation_pending"}:
         row.status = "reconciliation_required"
