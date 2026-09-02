@@ -117,6 +117,7 @@ class MiddlewareAIClient:
         tenant_id: str,
         correlation_id: str,
         idempotency_key: str,
+        reason: str,
     ) -> MiddlewareOperation:
         parsed = urlsplit(self.base_url)
         loopback = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1", "localhost"}
@@ -140,7 +141,7 @@ class MiddlewareAIClient:
                 response = await client.post(
                     f"{self.base_url}/api/v1/control/ai/operations/{quote(operation_id, safe='')}/cancel",
                     headers=headers,
-                    json={"request_id": request_id, "reason": "caller_requested"},
+                    json={"request_id": request_id, "reason": reason},
                 )
         except httpx.TransportError as exc:
             raise MiddlewareSubmissionError(

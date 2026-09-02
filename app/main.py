@@ -811,7 +811,15 @@ async def cancel_request(
     if row.status in {"completed", "failed", "cancelled", "cancellation_pending"}:
         raise HTTPException(status_code=409, detail="request_not_cancellable")
     previous = row.status
-    row.status = "cancellation_pending" if row.middleware_operation_id else "cancelled"
+    if row.middleware_operation_id:
+        row.status = "cancellation_pending"
+    elif previous == "reconciliation_required":
+        # Submission may have succeeded even though no operation id was returned.
+        # Preserve the unknown outcome; cancelling locally would falsely claim that
+        # downstream work cannot continue.
+        row.status = "reconciliation_required"
+    else:
+        row.status = "cancelled"
     row.cancelled_at = datetime.now(UTC) if row.status == "cancelled" else None
     row.resource_version += 1
     mutation = AIRequestMutationModel(
@@ -843,6 +851,7 @@ async def cancel_request(
                         "tenant_id": x_tenant_id,
                         "correlation_id": correlation_id,
                         "idempotency_key": idempotency_key,
+                        "reason": body.reason,
                     },
                     sort_keys=True,
                     separators=(",", ":"),

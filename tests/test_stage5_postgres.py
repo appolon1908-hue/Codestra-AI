@@ -173,6 +173,7 @@ async def test_queued_cancellation_is_dispatched_durably_once():
         async def cancel(self, operation_id, **kwargs):
             self.calls += 1
             assert operation_id == "middleware-operation-1"
+            assert kwargs["reason"] == "Customer’s request / duplicate"
 
     client = Client()
     assert await run_control_once(
@@ -191,4 +192,44 @@ async def test_queued_cancellation_is_dispatched_durably_once():
                 AIControlOutboxModel.state == "completed",
             )
         ) == 1
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unknown_submission_cancellation_preserves_reconciliation_state():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-reconcile-cancel-{uuid.uuid4()}"
+    request_id = uuid.uuid4()
+    async with sessions() as session:
+        session.add(
+            AIRequestModel(
+                id=request_id,
+                tenant_id=tenant_id,
+                task="summarize",
+                status="reconciliation_required",
+                input_digest="0" * 64,
+                idempotency_key=f"request-{uuid.uuid4()}",
+                request_fingerprint="1" * 64,
+                middleware_operation_id=None,
+                resource_version=1,
+            )
+        )
+        await session.commit()
+
+    async with sessions() as session:
+        result = await cancel_request(
+            request_id,
+            CancelRequest(expected_version=1, reason="cancel after unknown submission"),
+            tenant_id,
+            f"cancel-{uuid.uuid4()}",
+            session,
+        )
+        assert result.status == "reconciliation_required"
+        assert result.resource_version == 2
+        assert await session.scalar(
+            select(func.count()).select_from(AIControlOutboxModel).where(
+                AIControlOutboxModel.request_id == request_id
+            )
+        ) == 0
     await engine.dispose()

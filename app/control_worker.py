@@ -146,6 +146,7 @@ async def run_once(client: MiddlewareAIClient, *, lease_seconds: int, max_attemp
             tenant_id=payload["tenant_id"],
             correlation_id=payload["correlation_id"],
             idempotency_key=payload["idempotency_key"],
+            reason=payload["reason"],
         )
     except MiddlewareSubmissionError as exc:
         await fail(item, exc, max_attempts, session_factory=session_factory)
