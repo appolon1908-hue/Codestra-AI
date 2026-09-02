@@ -9,7 +9,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.main import CancelRequest, GenerationRequest, TaskType, cancel_request, generate, get_request
-from app.models import AIRequestMutationModel
+from app.models import AIEventOutboxModel, AIRequestMutationModel
+from app.event_worker import run_once
 
 pytestmark = pytest.mark.postgres
 
@@ -25,6 +26,9 @@ async def test_ai_idempotency_and_tenant_isolation():
 
     async with sessions() as session:
         first = await generate(request, tenant_a, key, session)
+        assert await session.scalar(
+            select(func.count()).select_from(AIEventOutboxModel).where(AIEventOutboxModel.state == "pending")
+        ) == 1
     async with sessions() as session:
         duplicate = await generate(request, tenant_a, key, session)
         assert duplicate.request_id == first.request_id
@@ -41,6 +45,46 @@ async def test_ai_idempotency_and_tenant_isolation():
         with pytest.raises(HTTPException) as denied:
             await get_request(first.request_id, tenant_b, session)
         assert denied.value.status_code == 404
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_durable_event_worker_claims_and_publishes_once():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-events-{uuid.uuid4()}"
+    async with sessions() as session:
+        created = await generate(
+            GenerationRequest(task=TaskType.CLASSIFY, input="synthetic event input"),
+            tenant_id,
+            f"event-{uuid.uuid4()}",
+            session,
+        )
+
+    published: list[tuple[str, dict[str, str]]] = []
+
+    class FakeRedis:
+        async def xadd(self, topic: str, fields: dict[str, str]):
+            published.append((topic, fields))
+            return "1-0"
+
+    assert await run_once(FakeRedis(), batch_size=10, lease_seconds=30, max_attempts=3) >= 1  # type: ignore[arg-type]
+    assert any(topic == "codestra.ai.requests" for topic, _fields in published)
+    assert any(fields["payload"].find(str(created.request_id)) >= 0 for _topic, fields in published)
+    async with sessions() as session:
+        assert await session.scalar(
+            select(func.count()).select_from(AIEventOutboxModel).where(
+                AIEventOutboxModel.state == "pending",
+                AIEventOutboxModel.payload_json.contains(str(created.request_id)),
+            )
+        ) == 0
+        assert await session.scalar(
+            select(func.count()).select_from(AIEventOutboxModel).where(
+                AIEventOutboxModel.state == "published",
+                AIEventOutboxModel.payload_json.contains(str(created.request_id)),
+            )
+        ) == 1
 
     await engine.dispose()
 

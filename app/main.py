@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request, Security, status
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -35,7 +37,7 @@ from .metrics import (
     render_metrics,
 )
 from .middleware_client import MiddlewareAIClient, MiddlewareSubmissionError
-from .models import AIRequestEventModel, AIRequestModel, AIRequestMutationModel
+from .models import AIEventOutboxModel, AIRequestEventModel, AIRequestModel, AIRequestMutationModel
 from .providers.router import ROUTES, resolve_route
 
 SERVICE = "codestra-ai"
@@ -155,6 +157,27 @@ def _error(
             }
         },
         headers={"X-Correlation-ID": correlation_id, "Cache-Control": "no-store"},
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    return _error(
+        request,
+        status_code=exc.status_code,
+        code=str(exc.detail),
+        message="request could not be completed",
+        retryable=exc.status_code >= 500,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, _exc: RequestValidationError) -> JSONResponse:
+    return _error(
+        request,
+        status_code=422,
+        code="request_validation_failed",
+        message="request validation failed",
     )
 
 
@@ -294,8 +317,7 @@ async def _event(
     actor_id: str,
     safe_detail: str | None = None,
 ) -> None:
-    session.add(
-        AIRequestEventModel(
+    event = AIRequestEventModel(
             tenant_id=row.tenant_id,
             request_id=row.id,
             event_type=event_type,
@@ -303,6 +325,25 @@ async def _event(
             new_status=row.status,
             actor_id=actor_id[:160],
             safe_detail=safe_detail[:240] if safe_detail else None,
+        )
+    session.add(event)
+    await session.flush()
+    session.add(
+        AIEventOutboxModel(
+            event_id=event.id,
+            topic="codestra.ai.requests",
+            payload_json=json.dumps(
+                {
+                    "event_id": event.id,
+                    "event_type": event.event_type,
+                    "request_id": str(row.id),
+                    "tenant_scope": "protected",
+                    "occurred_at": datetime.now(UTC).isoformat(),
+                    "safe_detail": event.safe_detail,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
     )
 
@@ -340,7 +381,7 @@ def health() -> dict[str, object]:
 @app.get("/ready", response_model=None)
 async def ready(request: Request, session: AsyncSession = Depends(get_session)):
     try:
-        await session.execute(select(1))
+        await asyncio.wait_for(session.execute(select(1)), timeout=2.0)
     except Exception:
         return _error(
             request,
@@ -558,17 +599,32 @@ async def generate(
             RECONCILIATION.inc()
         return _response(row)
 
+    locked_result = await session.execute(
+        select(AIRequestModel)
+        .where(AIRequestModel.id == row.id, AIRequestModel.tenant_id == tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    row = locked_result.scalar_one()
     previous = row.status
     row.middleware_operation_id = operation.operation_id
-    row.status = "queued"
+    if row.status in {"cancelled", "cancellation_pending"}:
+        row.status = "reconciliation_required"
+        event_type = "ai.middleware_operation_accepted_after_cancellation"
+        safe_detail = "cancellation_must_be_reconciled"
+        RECONCILIATION.inc()
+    else:
+        row.status = "queued"
+        event_type = "ai.middleware_operation_accepted"
+        safe_detail = operation.state
     row.resource_version += 1
     await _event(
         session,
         row,
-        event_type="ai.middleware_operation_accepted",
+        event_type=event_type,
         previous_status=previous,
         actor_id=actor_id,
-        safe_detail=operation.state,
+        safe_detail=safe_detail,
     )
     await session.commit()
     await session.refresh(row)

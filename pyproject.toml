@@ -16,6 +16,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "PyJWT[crypto]>=2.10,<3",
   "prometheus-client>=0.22,<1",
+  "redis[hiredis]>=6,<7",
 ]
 
 [project.optional-dependencies]

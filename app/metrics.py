@@ -63,6 +63,17 @@ CAPABILITY = Gauge(
     ("capability",),
     registry=REGISTRY,
 )
+EVENT_PUBLICATIONS = Counter(
+    "codestra_ai_event_publications_total",
+    "Durable lifecycle event publication outcomes.",
+    ("outcome",),
+    registry=REGISTRY,
+)
+EVENT_OUTBOX_DEPTH = Gauge(
+    "codestra_ai_event_outbox_depth",
+    "AI lifecycle events awaiting durable publication.",
+    registry=REGISTRY,
+)
 
 
 def render_metrics() -> tuple[bytes, str]:

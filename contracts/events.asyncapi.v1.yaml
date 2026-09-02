@@ -3,6 +3,7 @@ info:
   title: Codestra AI Events
   version: 1.0.0
   description: Sanitized durable lifecycle events emitted after committed AI request state changes.
+  x-delivery-semantics: at-least-once; consumers must deduplicate by event_id
 channels:
   aiRequestEvents:
     address: codestra.ai.requests
@@ -23,13 +24,14 @@ components:
         additionalProperties: false
         required: [event_id, event_type, request_id, tenant_scope, occurred_at]
         properties:
-          event_id: {type: string, format: uuid}
+          event_id: {type: integer, format: int64}
           event_type:
             type: string
             enum:
               - ai.request.accepted
               - ai.middleware_operation_accepted
               - ai.middleware_submission_failed
+              - ai.middleware_operation_accepted_after_cancellation
               - ai.request.cancellation_requested
           request_id: {type: string, format: uuid}
           tenant_scope: {type: string, const: protected}
