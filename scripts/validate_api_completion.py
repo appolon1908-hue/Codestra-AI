@@ -23,7 +23,11 @@ def main() -> None:
     source = yaml.safe_load((ROOT / "contracts/openapi.v1.yaml").read_text())
     committed = operations(source)
     runtime = operations(app.openapi())
-    aliases = {("GET", "/health"), ("GET", "/ready")}
+    aliases = {
+        ("GET", "/health"),
+        ("GET", "/ready"),
+        ("GET", "/capabilities"),
+    }
     assert not committed - runtime, sorted(committed - runtime)
     assert not runtime - committed - aliases, sorted(runtime - committed - aliases)
     for method, path in committed:
