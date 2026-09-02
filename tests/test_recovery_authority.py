@@ -17,11 +17,11 @@ def test_backup_is_encrypted_atomic_and_release_bound():
     assert 'shred -u "$work/database.dump"' in BACKUP
     assert "RELEASE_SHA=$CODESTRA_RELEASE_SHA" in BACKUP
     assert "IMAGE_DIGEST=$CODESTRA_IMAGE_DIGEST" in BACKUP
-    assert "sha256sum database.dump.gpg METADATA >SHA256SUMS" in BACKUP
+    assert "SIGNED-MANIFEST.sig" in BACKUP and "--detach-sign" in BACKUP
     assert 'sha256sum "$work/database.dump.gpg"' not in BACKUP
     assert 'mv "$marker" "$backup_root/LAST_SUCCESS"' in BACKUP
     assert "POSTGRES_DSN" not in BACKUP
-    assert 'sync "$work/database.dump.gpg"' in BACKUP
+    assert 'sync "$publish/database.dump.gpg"' in BACKUP
     assert 'sync "$marker"' in BACKUP
 
 
@@ -41,6 +41,13 @@ def test_restore_is_explicit_isolated_and_verifying():
     assert "POSTGRES_DSN" not in RESTORE
     assert 'flock -n 8' in RESTORE
     assert "restore evidence stamp collision" in RESTORE
+    assert "isolated restore database contains user objects" in RESTORE
+    assert "CODESTRA_EXPECTED_RELEASE_SHA" in RESTORE
+    assert "plaintext recovery work requires tmpfs" in BACKUP + RESTORE
+    assert ".publishing.XXXXXX" in BACKUP
+    assert RESTORE.index("backup release SHA mismatch") < RESTORE.index("gpg --batch --quiet --decrypt")
+    assert RESTORE.index("isolated restore database contains user objects") < RESTORE.index("gpg --batch --quiet --decrypt")
+    assert RESTORE.index("gpg --batch --quiet --decrypt") < RESTORE.index("pg_restore --exit-on-error")
 
 
 def test_no_automatic_destructive_production_path():
@@ -68,12 +75,14 @@ def _mock_tools(root: Path) -> Path:
     _executable(tools / "pg_restore", "exit 0\n")
     _executable(
         tools / "gpg",
+        'case " $* " in *" --list-secret-keys "*) exit 0;; *" --verify "*) printf "[GNUPG:] VALIDSIG %s 2026-09-01 0 4 0 1 10 00\\n" "${MOCK_SIGNER:?}"; exit 0;; esac\n'
         'out=\ninput=\nwhile [ "$#" -gt 0 ]; do\n'
-        '  case "$1" in --output) out=$2; shift 2;; --recipient) shift 2;; --*) shift;; *) input=$1; shift;; esac\n'
-        'done\n: "${out:?}"\n: "${input:?}"\ncp "$input" "$out"\n',
+        '  case "$1" in --output) out=$2; shift 2;; --recipient|--local-user) shift 2;; --detach-sign) shift;; --*) shift;; *) input=$1; shift;; esac\n'
+        'done\n: "${out:?}"\n: "${input:?}"\ncase "$out" in *.sig) printf synthetic-signature >"$out";; *) cp "$input" "$out";; esac\n',
     )
     _executable(tools / "shred", 'rm -f "${2:?}"\n')
     _executable(tools / "sync", "exit 0\n")
+    _executable(tools / "findmnt", "echo tmpfs\n")
     return tools
 
 
@@ -82,6 +91,8 @@ def test_backup_publishes_relocatable_verified_manifest():
         root = Path(directory)
         tools = _mock_tools(root)
         backup_root = root / "backups"
+        work_root = root / "work"
+        work_root.mkdir()
         passfile = root / "pgpass"
         passfile.write_text("synthetic")
         passfile.chmod(0o600)
@@ -96,9 +107,12 @@ def test_backup_publishes_relocatable_verified_manifest():
                 "PGUSER": "synthetic",
                 "PGPASSFILE": str(passfile),
                 "CODESTRA_AI_BACKUP_ROOT": str(backup_root),
+                "CODESTRA_AI_RECOVERY_WORK_ROOT": str(work_root),
                 "CODESTRA_RELEASE_SHA": "1" * 40,
                 "CODESTRA_IMAGE_DIGEST": "sha256:" + "2" * 64,
                 "CODESTRA_BACKUP_GPG_RECIPIENT": "synthetic-test-recipient",
+                "CODESTRA_BACKUP_GPG_SIGNING_FINGERPRINT": "A" * 40,
+                "MOCK_SIGNER": "A" * 40,
             },
             text=True,
             capture_output=True,
@@ -109,6 +123,7 @@ def test_backup_publishes_relocatable_verified_manifest():
         published = backup_root / stamp
         assert not (published / "database.dump").exists()
         assert (published / "database.dump.gpg").is_file()
+        assert (published / "SIGNED-MANIFEST.sig").is_file()
         verified = subprocess.run(
             ["sha256sum", "-c", "SHA256SUMS"],
             cwd=published,
@@ -129,14 +144,19 @@ def test_restore_refuses_source_database_identity_before_pg_restore():
         passfile.chmod(0o600)
         backup = root / "backup"
         backup.mkdir()
+        work_root = root / "work"
+        work_root.mkdir()
         (backup / "database.dump.gpg").write_text("synthetic")
         (backup / "METADATA").write_text(
             "SCHEMA=codestra-ai-backup.v1\nSTAMP=20260901T000000Z\n"
             f"DATABASE=codestra_ai\nRELEASE_SHA={'1' * 40}\n"
-            f"IMAGE_DIGEST=sha256:{'2' * 64}\nENCRYPTION=OPENPGP\n"
+            f"IMAGE_DIGEST=sha256:{'2' * 64}\nSIGNING_FINGERPRINT={'A' * 40}\nENCRYPTION=OPENPGP\n"
         )
+        with (backup / "SIGNED-MANIFEST").open("w") as manifest:
+            subprocess.run(["sha256sum", "database.dump.gpg", "METADATA"], cwd=backup, text=True, stdout=manifest, check=True)
+        (backup / "SIGNED-MANIFEST.sig").write_text("synthetic-signature")
         subprocess.run(
-            ["sha256sum", "database.dump.gpg", "METADATA"],
+            ["sha256sum", "database.dump.gpg", "METADATA", "SIGNED-MANIFEST", "SIGNED-MANIFEST.sig"],
             cwd=backup,
             text=True,
             stdout=(backup / "SHA256SUMS").open("w"),
@@ -154,8 +174,13 @@ def test_restore_refuses_source_database_identity_before_pg_restore():
                 "PGPASSFILE": str(passfile),
                 "CODESTRA_AI_BACKUP_DIR": str(backup),
                 "CODESTRA_AI_RESTORE_EVIDENCE_DIR": str(root / "evidence"),
+                "CODESTRA_AI_RECOVERY_WORK_ROOT": str(work_root),
+                "CODESTRA_EXPECTED_RELEASE_SHA": "1" * 40,
+                "CODESTRA_EXPECTED_IMAGE_DIGEST": "sha256:" + "2" * 64,
+                "CODESTRA_BACKUP_GPG_SIGNING_FINGERPRINT": "A" * 40,
                 "ALLOW_ISOLATED_RESTORE": "true",
                 "MOCK_PSQL_VALUE": "codestra_ai",
+                "MOCK_SIGNER": "A" * 40,
             },
             text=True,
             capture_output=True,
@@ -168,6 +193,7 @@ def test_restore_refuses_source_database_identity_before_pg_restore():
 def test_freshness_passes_current_marker_and_fails_stale_marker():
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
+        tools = _mock_tools(root)
         current = subprocess.run(
             ["date", "-u", "+%Y%m%dT%H%M%SZ"],
             text=True,
@@ -177,19 +203,33 @@ def test_freshness_passes_current_marker_and_fails_stale_marker():
         artifact = root / current
         artifact.mkdir()
         (artifact / "database.dump.gpg").write_text("synthetic")
-        (artifact / "METADATA").write_text("synthetic")
-        with (artifact / "SHA256SUMS").open("w") as manifest:
+        (artifact / "METADATA").write_text(f"SCHEMA=codestra-ai-backup.v1\nSTAMP={current}\nSIGNING_FINGERPRINT={'A' * 40}\n")
+        with (artifact / "SIGNED-MANIFEST").open("w") as manifest:
             subprocess.run(["sha256sum", "database.dump.gpg", "METADATA"], cwd=artifact, text=True, stdout=manifest, check=True)
+        (artifact / "SIGNED-MANIFEST.sig").write_text("synthetic-signature")
+        with (artifact / "SHA256SUMS").open("w") as manifest:
+            subprocess.run(["sha256sum", "database.dump.gpg", "METADATA", "SIGNED-MANIFEST", "SIGNED-MANIFEST.sig"], cwd=artifact, text=True, stdout=manifest, check=True)
         (root / "LAST_SUCCESS").write_text(current + "\n")
         env = {
             **os.environ,
             "CODESTRA_RECOVERY_ROOT": str(root),
             "CODESTRA_RECOVERY_MAX_AGE_SECONDS": "120",
+            "CODESTRA_BACKUP_GPG_SIGNING_FINGERPRINT": "A" * 40,
+            "MOCK_SIGNER": "A" * 40,
+            "PATH": f"{tools}:{os.environ['PATH']}",
         }
         assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 0
+        wrong_signer = {**env, "CODESTRA_BACKUP_GPG_SIGNING_FINGERPRINT": "B" * 40}
+        assert subprocess.run([str(FRESHNESS)], env=wrong_signer, capture_output=True).returncode == 1
         (artifact / "database.dump.gpg").write_text("corrupt")
         assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 1
         (artifact / "database.dump.gpg").write_text("synthetic")
+        renamed = "20990101T000000Z"
+        (root / renamed).mkdir()
+        for name in ("database.dump.gpg", "METADATA", "SIGNED-MANIFEST", "SIGNED-MANIFEST.sig", "SHA256SUMS"):
+            (root / renamed / name).write_bytes((artifact / name).read_bytes())
+        (root / "LAST_SUCCESS").write_text(renamed + "\n")
+        assert subprocess.run([str(FRESHNESS)], env=env, capture_output=True).returncode == 1
         stale = "20200101T000000Z"
         (root / stale).mkdir()
         (root / "LAST_SUCCESS").write_text(stale + "\n")

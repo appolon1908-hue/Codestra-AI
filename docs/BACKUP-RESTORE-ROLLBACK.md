@@ -6,16 +6,21 @@ Before a migration or rollout, an authorized operator runs
 `operations/recovery/backup-postgres.sh` with libpq `PGHOST`, `PGPORT`,
 `PGDATABASE`, `PGUSER`, and an owner-protected `PGPASSFILE`, a
 root-owned mode-0700 backup directory, the exact release SHA, exact image digest,
-and an approved OpenPGP recovery recipient. The command creates a custom-format
+an approved OpenPGP recovery recipient, and a pinned backup-signing fingerprint.
+The command creates a custom-format dump in a verified tmpfs work root,
 PostgreSQL dump, validates its catalog, encrypts it, removes the plaintext, and
-atomically publishes checksums, immutable release metadata, and `LAST_SUCCESS`.
+atomically publishes a signed manifest, checksums, immutable release metadata,
+and `LAST_SUCCESS`. Freshness binds the marker to authenticated metadata.
 It keeps database credentials out of process arguments and never prints the
 passfile or encryption recipient.
 
 Restore verification must use a disposable database whose name explicitly
-contains `restore` and differs from the source database recorded in the backup.
+contains `restore`, is empty, uses a verified tmpfs restore work root, and
+differs from the source database recorded in
+the backup. The caller supplies the exact expected release SHA and image digest.
 Set `ALLOW_ISOLATED_RESTORE=true` and run
-`operations/recovery/verify-isolated-restore.sh`. It verifies checksums,
+`operations/recovery/verify-isolated-restore.sh`. It verifies the pinned signer,
+checksums, and exact release tuple,
 decrypts only inside a temporary mode-0700 directory, restores with
 `--exit-on-error`, and checks the table, required columns, and tenant/idempotency
 index before atomically publishing a checksum-bearing result.
