@@ -30,7 +30,10 @@ SERVICE = "codestra-ai"
 async def operational_headers(request: Request, call_next):
     correlation_id = request.headers.get("X-Correlation-ID") or str(uuid4())
     request.state.correlation_id = correlation_id
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        response = JSONResponse(status_code=500, content={"detail": "internal_error", "correlation_id": correlation_id})
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Correlation-ID"] = correlation_id
     return response
