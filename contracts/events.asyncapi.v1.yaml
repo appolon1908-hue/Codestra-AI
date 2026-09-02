@@ -33,6 +33,9 @@ components:
               - ai.middleware_submission_failed
               - ai.middleware_submission_failed_after_state_change
               - ai.middleware_operation_accepted_after_cancellation
+              - ai.middleware_idempotency_mismatch
+              - ai.middleware_cancellation_accepted
+              - ai.middleware_cancellation_failed
               - ai.request.cancellation_requested
           request_id: {type: string, format: uuid}
           tenant_scope: {type: string, const: protected}

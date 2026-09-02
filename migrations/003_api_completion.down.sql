@@ -1,3 +1,4 @@
+DROP TABLE IF EXISTS ai_control_outbox;
 DROP TABLE IF EXISTS ai_event_outbox;
 DROP TABLE IF EXISTS ai_request_mutations;
 DROP TABLE IF EXISTS ai_request_events;

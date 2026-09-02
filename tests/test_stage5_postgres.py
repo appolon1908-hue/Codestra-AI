@@ -9,8 +9,9 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.main import CancelRequest, GenerationRequest, TaskType, cancel_request, generate, get_request
-from app.models import AIEventOutboxModel, AIRequestMutationModel
+from app.models import AIControlOutboxModel, AIEventOutboxModel, AIRequestModel, AIRequestMutationModel
 from app.event_worker import run_once
+from app.control_worker import run_once as run_control_once
 
 pytestmark = pytest.mark.postgres
 
@@ -125,4 +126,69 @@ async def test_cancellation_idempotency_replays_committed_result():
             )
         ) == 1
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_queued_cancellation_is_dispatched_durably_once():
+    engine = create_async_engine(os.environ["DATABASE_URL"])
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    tenant_id = f"tenant-control-{uuid.uuid4()}"
+    request_id = uuid.uuid4()
+    async with sessions() as session:
+        session.add(
+            AIRequestModel(
+                id=request_id,
+                tenant_id=tenant_id,
+                task="summarize",
+                status="queued",
+                input_digest="0" * 64,
+                idempotency_key=f"request-{uuid.uuid4()}",
+                request_fingerprint="1" * 64,
+                middleware_operation_id="middleware-operation-1",
+                resource_version=1,
+            )
+        )
+        await session.commit()
+    async with sessions() as session:
+        pending = await cancel_request(
+            request_id,
+            CancelRequest(expected_version=1, reason="Customer’s request / duplicate"),
+            tenant_id,
+            f"cancel-{uuid.uuid4()}",
+            session,
+        )
+        assert pending.status == "cancellation_pending"
+        assert await session.scalar(
+            select(func.count()).select_from(AIControlOutboxModel).where(
+                AIControlOutboxModel.request_id == request_id,
+                AIControlOutboxModel.state == "pending",
+            )
+        ) == 1
+
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        async def cancel(self, operation_id, **kwargs):
+            self.calls += 1
+            assert operation_id == "middleware-operation-1"
+
+    client = Client()
+    assert await run_control_once(
+        client, lease_seconds=30, max_attempts=3, session_factory=sessions
+    ) is True
+    assert client.calls == 1
+    assert await run_control_once(
+        client, lease_seconds=30, max_attempts=3, session_factory=sessions
+    ) is False
+    async with sessions() as session:
+        row = await session.get(AIRequestModel, request_id)
+        assert row is not None and row.status == "cancelled"
+        assert await session.scalar(
+            select(func.count()).select_from(AIControlOutboxModel).where(
+                AIControlOutboxModel.request_id == request_id,
+                AIControlOutboxModel.state == "completed",
+            )
+        ) == 1
     await engine.dispose()

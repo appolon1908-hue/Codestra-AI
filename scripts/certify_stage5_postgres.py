@@ -42,6 +42,7 @@ async def main() -> None:
         assert await conn.fetchval("SELECT to_regclass('public.ai_request_events')") == "ai_request_events"
         assert await conn.fetchval("SELECT to_regclass('public.ai_request_mutations')") == "ai_request_mutations"
         assert await conn.fetchval("SELECT to_regclass('public.ai_event_outbox')") == "ai_event_outbox"
+        assert await conn.fetchval("SELECT to_regclass('public.ai_control_outbox')") == "ai_control_outbox"
         assert await conn.fetchval(
             "SELECT count(*) FROM pg_indexes WHERE indexname='uq_ai_request_idempotency'"
         ) == 1
@@ -50,6 +51,7 @@ async def main() -> None:
         assert await conn.fetchval("SELECT to_regclass('public.ai_request_events')") is None
         assert await conn.fetchval("SELECT to_regclass('public.ai_request_mutations')") is None
         assert await conn.fetchval("SELECT to_regclass('public.ai_event_outbox')") is None
+        assert await conn.fetchval("SELECT to_regclass('public.ai_control_outbox')") is None
         await run_files(conn, UP)
     finally:
         await conn.close()

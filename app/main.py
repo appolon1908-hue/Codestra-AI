@@ -37,7 +37,13 @@ from .metrics import (
     render_metrics,
 )
 from .middleware_client import MiddlewareAIClient, MiddlewareSubmissionError
-from .models import AIEventOutboxModel, AIRequestEventModel, AIRequestModel, AIRequestMutationModel
+from .models import (
+    AIControlOutboxModel,
+    AIEventOutboxModel,
+    AIRequestEventModel,
+    AIRequestModel,
+    AIRequestMutationModel,
+)
 from .providers.router import ROUTES, resolve_route
 
 SERVICE = "codestra-ai"
@@ -129,11 +135,7 @@ class PagedEvents(BaseModel):
 class CancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=1)
-    reason: str = Field(
-        min_length=1,
-        max_length=240,
-        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.: -]*$",
-    )
+    reason: str = Field(min_length=1, max_length=240)
 
 
 def _error(
@@ -449,7 +451,7 @@ def capabilities() -> dict[str, object]:
 
 
 @router.get("/models")
-def models() -> dict[str, object]:
+def models(x_tenant_id: TenantHeader) -> dict[str, object]:
     items = [
         {
             "task": task,
@@ -465,7 +467,7 @@ def models() -> dict[str, object]:
 
 
 @router.get("/policies")
-def policies() -> dict[str, object]:
+def policies(x_tenant_id: TenantHeader) -> dict[str, object]:
     return {
         "items": [
             {
@@ -811,8 +813,7 @@ async def cancel_request(
     row.status = "cancellation_pending" if row.middleware_operation_id else "cancelled"
     row.cancelled_at = datetime.now(UTC) if row.status == "cancelled" else None
     row.resource_version += 1
-    session.add(
-        AIRequestMutationModel(
+    mutation = AIRequestMutationModel(
             tenant_id=x_tenant_id,
             request_id=request_id,
             mutation_type="cancel",
@@ -820,7 +821,33 @@ async def cancel_request(
             request_fingerprint=fingerprint,
             result_version=row.resource_version,
         )
-    )
+    session.add(mutation)
+    await session.flush()
+    if row.status == "cancellation_pending":
+        correlation_id = (
+            request.state.correlation_id
+            if request is not None and hasattr(request.state, "correlation_id")
+            else str(uuid4())
+        )
+        session.add(
+            AIControlOutboxModel(
+                tenant_id=x_tenant_id,
+                request_id=request_id,
+                mutation_id=mutation.id,
+                action="cancel",
+                payload_json=json.dumps(
+                    {
+                        "request_id": str(request_id),
+                        "middleware_operation_id": row.middleware_operation_id,
+                        "tenant_id": x_tenant_id,
+                        "correlation_id": correlation_id,
+                        "idempotency_key": idempotency_key,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
     await _event(
         session,
         row,
@@ -831,7 +858,7 @@ async def cancel_request(
             if request is not None and hasattr(request.state, "auth")
             else "codestra-ai-internal"
         ),
-        safe_detail=body.reason,
+        safe_detail="cancellation_requested",
     )
     await session.commit()
     await session.refresh(row)

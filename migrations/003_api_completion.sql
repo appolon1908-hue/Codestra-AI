@@ -67,3 +67,24 @@ CREATE TABLE IF NOT EXISTS ai_event_outbox (
 
 CREATE INDEX IF NOT EXISTS ix_ai_event_outbox_claim
     ON ai_event_outbox (state, available_at, lease_until, created_at);
+
+CREATE TABLE IF NOT EXISTS ai_control_outbox (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id varchar(128) NOT NULL,
+    request_id uuid NOT NULL,
+    mutation_id uuid NOT NULL UNIQUE REFERENCES ai_request_mutations(id) ON DELETE CASCADE,
+    action varchar(48) NOT NULL,
+    payload_json text NOT NULL,
+    state varchar(32) NOT NULL DEFAULT 'pending',
+    attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    available_at timestamptz NOT NULL DEFAULT now(),
+    lease_until timestamptz,
+    last_error_code varchar(80),
+    completed_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT fk_ai_control_outbox_request FOREIGN KEY (tenant_id, request_id)
+      REFERENCES ai_requests (tenant_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS ix_ai_control_outbox_claim
+    ON ai_control_outbox (state, available_at, lease_until, created_at);

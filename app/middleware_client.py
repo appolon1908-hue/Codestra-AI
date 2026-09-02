@@ -4,7 +4,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -108,3 +108,57 @@ class MiddlewareAIClient:
                 else None
             ),
         )
+
+    async def cancel(
+        self,
+        operation_id: str,
+        *,
+        request_id: str,
+        tenant_id: str,
+        correlation_id: str,
+        idempotency_key: str,
+    ) -> MiddlewareOperation:
+        parsed = urlsplit(self.base_url)
+        loopback = parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "::1", "localhost"}
+        if (
+            not (parsed.scheme == "https" or loopback)
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise MiddlewareSubmissionError("middleware_base_url_invalid")
+        headers = {
+            "Authorization": f"Bearer {self._token()}",
+            "X-Tenant-ID": tenant_id,
+            "X-Correlation-ID": correlation_id,
+            "Idempotency-Key": idempotency_key,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}/api/v1/control/ai/operations/{quote(operation_id, safe='')}/cancel",
+                    headers=headers,
+                    json={"request_id": request_id, "reason": "caller_requested"},
+                )
+        except httpx.TransportError as exc:
+            raise MiddlewareSubmissionError(
+                "middleware_cancellation_outcome_unknown", outcome_unknown=True
+            ) from exc
+        if response.status_code not in {200, 202}:
+            raise MiddlewareSubmissionError(
+                f"middleware_cancellation_rejected_{response.status_code}",
+                outcome_unknown=response.status_code >= 500,
+            )
+        try:
+            document = response.json()
+            returned_id = document["operation_id"]
+            state = document["state"]
+            if returned_id != operation_id or not isinstance(state, str) or not state.strip():
+                raise TypeError("invalid cancellation response")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise MiddlewareSubmissionError(
+                "middleware_cancellation_response_invalid", outcome_unknown=True
+            ) from exc
+        return MiddlewareOperation(operation_id=operation_id, state=state.strip(), status_url=None)
