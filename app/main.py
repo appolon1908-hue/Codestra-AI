@@ -16,8 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .db import get_session
 from .models import AIRequestModel
 from .providers.router import resolve_route
+from .telemetry import audit_event, configure_telemetry, install_correlation_middleware
 
 app = FastAPI(title="Codestra AI Gateway", version="0.3.0")
+install_correlation_middleware(app)
+TELEMETRY_EXPORT_ENABLED = configure_telemetry(app)
 router = APIRouter(prefix="/v1/ai")
 EXTERNAL_MODEL_CALLS_ENABLED = os.getenv("EXTERNAL_MODEL_CALLS_ENABLED", "false").lower() == "true"
 
@@ -94,6 +97,8 @@ def capabilities() -> dict[str, object]:
         "audit": True,
         "usage_accounting": True,
         "external_model_calls": EXTERNAL_MODEL_CALLS_ENABLED,
+        "correlation_ids": True,
+        "telemetry_export": TELEMETRY_EXPORT_ENABLED,
         "business_action_authority": False,
     }
 
@@ -117,6 +122,7 @@ async def generate(
     if row is not None:
         if row.request_fingerprint != fingerprint:
             raise HTTPException(status_code=409, detail="idempotency_conflict")
+        audit_event("ai_request_replayed", request_id=str(row.id), status=row.status)
         return _response(row)
 
     route = resolve_route(body.task.value)
@@ -145,8 +151,10 @@ async def generate(
         row = result.scalar_one_or_none()
         if row is None or row.request_fingerprint != fingerprint:
             raise HTTPException(status_code=409, detail="idempotency_conflict")
+        audit_event("ai_request_replayed", request_id=str(row.id), status=row.status)
         return _response(row)
     await session.refresh(row)
+    audit_event("ai_request_recorded", request_id=str(row.id), status=row.status)
 
     if EXTERNAL_MODEL_CALLS_ENABLED:
         raise HTTPException(status_code=501, detail="external_provider_execution_not_implemented")
