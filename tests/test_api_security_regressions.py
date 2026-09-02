@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from jwt.exceptions import PyJWKClientError
 
 from app import auth
-from app.main import GenerationRequest, TaskType, app, generate
+from app.main import GenerationRequest, TaskType, _decode_cursor, app, generate
 from app.middleware_client import MiddlewareAIClient, MiddlewareSubmissionError
 
 
@@ -157,3 +157,11 @@ async def test_jwks_lookup_failure_is_a_safe_authentication_error(monkeypatch: p
     assert denied.value.status_code == 401
     assert denied.value.detail == "invalid_access_token"
     assert denied.value.headers == {"WWW-Authenticate": "Bearer"}
+
+
+@pytest.mark.parametrize("cursor", ["a", "_w", "not-base64!!"])
+def test_every_malformed_cursor_is_a_safe_client_error(cursor: str):
+    with pytest.raises(HTTPException) as invalid:
+        _decode_cursor(cursor)
+    assert invalid.value.status_code == 400
+    assert invalid.value.detail == "invalid_cursor"

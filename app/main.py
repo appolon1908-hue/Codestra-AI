@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import asyncio
 import hashlib
 import json
@@ -371,7 +372,7 @@ def _decode_cursor(value: str | None) -> tuple[datetime, UUID] | None:
             base64.urlsafe_b64decode(value + padding).decode("utf-8")
         )
         return datetime.fromisoformat(created_at), UUID(identity)
-    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=400, detail="invalid_cursor") from exc
 
 
@@ -807,7 +808,7 @@ async def cancel_request(
         return _response(row)
     if row.resource_version != body.expected_version:
         raise HTTPException(status_code=409, detail="stale_resource_version")
-    if row.status in {"completed", "failed", "cancelled"}:
+    if row.status in {"completed", "failed", "cancelled", "cancellation_pending"}:
         raise HTTPException(status_code=409, detail="request_not_cancellable")
     previous = row.status
     row.status = "cancellation_pending" if row.middleware_operation_id else "cancelled"
