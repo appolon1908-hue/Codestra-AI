@@ -241,7 +241,7 @@ async def test_unknown_submission_cancellation_preserves_reconciliation_state():
 
 
 @pytest.mark.asyncio
-async def test_nonterminal_middleware_cancellation_requires_reconciliation():
+async def test_non_cancellation_terminal_middleware_state_requires_reconciliation():
     engine = create_async_engine(os.environ["DATABASE_URL"])
     sessions = async_sessionmaker(engine, expire_on_commit=False)
     tenant_id = f"tenant-control-pending-{uuid.uuid4()}"
@@ -264,7 +264,7 @@ async def test_nonterminal_middleware_cancellation_requires_reconciliation():
 
     class Client:
         async def cancel(self, operation_id, **_kwargs):
-            return MiddlewareOperation(operation_id, "cancellation_pending", None)
+            return MiddlewareOperation(operation_id, "completed", None)
 
     assert await run_control_once(Client(), lease_seconds=30, max_attempts=3, session_factory=sessions)
     async with sessions() as session:

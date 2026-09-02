@@ -35,3 +35,9 @@ def test_runtime_openapi_declares_bearer_security_for_protected_routes():
     assert document["paths"]["/v1/ai/generate"]["post"]["security"] == [
         {"serviceBearer": ["ai.request"]}
     ]
+
+
+def test_request_list_filters_are_declared_in_runtime_and_source_contracts():
+    parameters = app.openapi()["paths"]["/v1/ai/requests"]["get"]["parameters"]
+    names = {parameter["name"] for parameter in parameters}
+    assert {"cursor", "limit", "status", "task"} <= names

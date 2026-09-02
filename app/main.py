@@ -519,7 +519,11 @@ async def generate(
     request: Request = None,
 ) -> GenerationResponse:
     tenant_id = _tenant(x_tenant_id, body.tenant_id)
-    correlation_id = x_correlation_id or str(uuid4())
+    correlation_id = (
+        request.state.correlation_id
+        if request is not None and hasattr(request.state, "correlation_id")
+        else (x_correlation_id or str(uuid4())).strip()
+    )
     actor_id = (
         request.state.auth.subject
         if request is not None and hasattr(request.state, "auth")

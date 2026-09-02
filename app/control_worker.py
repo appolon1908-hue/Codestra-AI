@@ -99,7 +99,7 @@ async def complete(
         if request is None:
             return
         previous = request.status
-        terminal = middleware_state.lower() in {"cancelled", "canceled", "completed", "succeeded"}
+        terminal = middleware_state.lower() in {"cancelled", "canceled"}
         if previous == "cancellation_pending" and terminal:
             request.status = "cancelled"
             request.cancelled_at = datetime.now(UTC)

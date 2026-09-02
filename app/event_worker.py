@@ -61,12 +61,12 @@ async def claim(batch_size: int, lease_seconds: int) -> list[ClaimedEvent]:
         return [ClaimedEvent(row.id, row.event_id, row.topic, row.payload_json, row.attempts) for row in rows]
 
 
-async def acknowledge(identity: UUID) -> None:
+async def acknowledge(identity: UUID, attempts: int) -> None:
     async with SessionLocal() as session:
         row = await session.scalar(
             select(AIEventOutboxModel).where(AIEventOutboxModel.id == identity).with_for_update()
         )
-        if row is None or row.state != "publishing":
+        if row is None or row.state != "publishing" or row.attempts != attempts:
             return
         row.state = "published"
         row.published_at = datetime.now(UTC)
@@ -79,7 +79,7 @@ async def reject(identity: UUID, attempts: int, max_attempts: int) -> None:
         row = await session.scalar(
             select(AIEventOutboxModel).where(AIEventOutboxModel.id == identity).with_for_update()
         )
-        if row is None or row.state != "publishing":
+        if row is None or row.state != "publishing" or row.attempts != attempts:
             return
         row.state = "dead_letter" if attempts >= max_attempts else "pending"
         row.available_at = datetime.now(UTC) + timedelta(seconds=min(2 ** min(attempts, 8), 300))
@@ -110,7 +110,7 @@ async def run_once(redis: Redis, *, batch_size: int, lease_seconds: int, max_att
             await reject(event.id, event.attempts, max_attempts)
             EVENT_PUBLICATIONS.labels(outcome="retry" if event.attempts < max_attempts else "dead_letter").inc()
         else:
-            await acknowledge(event.id)
+            await acknowledge(event.id, event.attempts)
             EVENT_PUBLICATIONS.labels(outcome="published").inc()
     EVENT_OUTBOX_DEPTH.set(await pending_depth())
     return len(events)
