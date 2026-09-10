@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -146,6 +147,10 @@ async def test_integrity_race_replay_is_audited(monkeypatch):
         input_tokens=0,
         output_tokens=0,
         cost_micros=0,
+        middleware_operation_id=None,
+        resource_version=1,
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
     )
 
     class Result:
@@ -164,6 +169,9 @@ async def test_integrity_race_replay_is_audited(monkeypatch):
 
         def add(self, _row):
             return None
+
+        async def flush(self):
+            raise IntegrityError("duplicate", {}, RuntimeError("unique violation"))
 
         async def commit(self):
             raise IntegrityError("duplicate", {}, RuntimeError("unique violation"))
@@ -189,4 +197,33 @@ def test_existing_application_exposes_correlation_header_without_business_writes
     response = TestClient(app).get("/health")
     assert response.status_code == 200
     assert response.headers["X-Correlation-ID"]
-    assert response.json()["external_model_calls_enabled"] is False
+    capability_response = TestClient(app).get("/v1/ai/capabilities")
+    assert capability_response.status_code == 200
+    assert capability_response.json()["external_model_calls_enabled"] is False
+
+
+def test_telemetry_endpoint_does_not_override_disabled_capability(monkeypatch):
+    from app.telemetry import configure_telemetry
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://alloy:4318")
+    monkeypatch.setenv("TELEMETRY_EXPORT_ENABLED", "false")
+    assert configure_telemetry(FastAPI()) is False
+
+
+def test_application_audit_uses_response_correlation_and_resets_context(monkeypatch):
+    from app.telemetry import audit_logger
+    records = []
+    monkeypatch.setattr(audit_logger, "info", records.append)
+    original = correlation_id_context.get()
+
+    @app.get("/test-audit-correlation")
+    def audit_probe():
+        audit_event("correlation_probe")
+        return {"ok": True}
+
+    try:
+        response = TestClient(app).get("/test-audit-correlation")
+        record = json.loads(records[-1])
+        assert record["correlation_id"] == response.headers["X-Correlation-ID"]
+        assert correlation_id_context.get() == original
+    finally:
+        app.router.routes[:] = [route for route in app.router.routes if getattr(route, "path", None) != "/test-audit-correlation"]

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codestra-ai"
-version = "0.3.0"
+version = "0.4.0"
 description = "Codestra governed AI gateway"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,10 +18,17 @@ dependencies = [
   "opentelemetry-sdk>=1.38,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.38,<2",
   "opentelemetry-instrumentation-fastapi>=0.59b0,<1",
+  "PyJWT[crypto]>=2.10,<3",
+  "prometheus-client>=0.22,<1",
+  "redis[hiredis]>=6,<7",
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
+test = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<1",
+  "PyYAML>=6.0,<7",
+]
 
 [tool.setuptools]
 packages = ["app", "app.providers"]

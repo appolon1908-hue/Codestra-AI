@@ -1,0 +1,227 @@
+openapi: 3.1.0
+info:
+  title: Codestra AI Gateway
+  version: 0.4.0
+  description: Governed asynchronous AI request control plane. AI has no business-action authority.
+servers:
+  - url: https://api.codestra.co
+paths:
+  /health/live:
+    get:
+      operationId: aiHealthLive
+      responses:
+        "200": {description: Process is live}
+  /health/ready:
+    get:
+      operationId: aiHealthReady
+      responses:
+        "200": {description: Required dependencies are ready}
+        "503": {$ref: "#/components/responses/SafeError"}
+  /version:
+    get:
+      operationId: aiVersion
+      responses:
+        "200": {description: Immutable release identity}
+  /metrics:
+    get:
+      operationId: aiMetrics
+      security: [{serviceBearer: [metrics.read]}]
+      responses:
+        "200": {description: Private Prometheus metrics}
+        "401": {$ref: "#/components/responses/SafeError"}
+        "403": {$ref: "#/components/responses/SafeError"}
+  /v1/ai/capabilities:
+    get:
+      operationId: getAiCapabilities
+      responses:
+        "200": {description: Truthful capability state}
+  /v1/ai/models:
+    get:
+      operationId: listAiModels
+      security: [{serviceBearer: [ai.read]}]
+      parameters: [{$ref: "#/components/parameters/Tenant"}]
+      responses:
+        "200": {description: Allowlisted model routes}
+  /v1/ai/policies:
+    get:
+      operationId: listAiPolicies
+      security: [{serviceBearer: [ai.read]}]
+      parameters: [{$ref: "#/components/parameters/Tenant"}]
+      responses:
+        "200": {description: Governed policy catalogue}
+  /v1/ai/usage:
+    get:
+      operationId: getAiUsage
+      security: [{serviceBearer: [ai.read]}]
+      parameters:
+        - {$ref: "#/components/parameters/Tenant"}
+        - {name: days, in: query, schema: {type: integer, minimum: 1, maximum: 366}}
+      responses:
+        "200": {description: Tenant aggregate usage}
+  /v1/ai/generate:
+    post:
+      operationId: submitAiGeneration
+      security: [{serviceBearer: [ai.request]}]
+      parameters:
+        - {$ref: "#/components/parameters/Tenant"}
+        - {$ref: "#/components/parameters/Correlation"}
+        - {$ref: "#/components/parameters/Idempotency"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/GenerationRequest"}
+      responses:
+        "202":
+          description: Durable request accepted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GenerationResponse"}
+        "409": {$ref: "#/components/responses/SafeError"}
+  /v1/ai/requests:
+    get:
+      operationId: listAiRequests
+      security: [{serviceBearer: [ai.read]}]
+      parameters:
+        - {$ref: "#/components/parameters/Tenant"}
+        - {name: cursor, in: query, schema: {type: string, maxLength: 512}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100}}
+        - {name: status, in: query, schema: {type: string, maxLength: 32}}
+        - {name: task, in: query, schema: {type: string, enum: [copy, classify, summarize, score, creative_brief]}}
+      responses:
+        "200":
+          description: Cursor-paginated durable requests
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/PagedRequests"}
+  /v1/ai/requests/{request_id}:
+    get:
+      operationId: getAiRequest
+      security: [{serviceBearer: [ai.read]}]
+      parameters:
+        - {$ref: "#/components/parameters/Tenant"}
+        - {name: request_id, in: path, required: true, schema: {type: string, format: uuid}}
+      responses:
+        "200": {description: Durable request}
+        "404": {$ref: "#/components/responses/SafeError"}
+  /v1/ai/requests/{request_id}/events:
+    get:
+      operationId: listAiRequestEvents
+      security: [{serviceBearer: [ai.read]}]
+      parameters:
+        - {$ref: "#/components/parameters/Tenant"}
+        - {name: request_id, in: path, required: true, schema: {type: string, format: uuid}}
+        - {name: cursor, in: query, schema: {type: integer, minimum: 1}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+      responses:
+        "200": {description: Append-only request events}
+  /v1/ai/requests/{request_id}/cancel:
+    post:
+      operationId: cancelAiRequest
+      security: [{serviceBearer: [ai.cancel]}]
+      parameters:
+        - {$ref: "#/components/parameters/Tenant"}
+        - {$ref: "#/components/parameters/Correlation"}
+        - {$ref: "#/components/parameters/Idempotency"}
+        - {name: request_id, in: path, required: true, schema: {type: string, format: uuid}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expected_version, reason]
+              properties:
+                expected_version: {type: integer, minimum: 1}
+                reason: {type: string, minLength: 1, maxLength: 240}
+      responses:
+        "200": {description: Cancellation recorded or submitted}
+        "409": {$ref: "#/components/responses/SafeError"}
+components:
+  securitySchemes:
+    serviceBearer:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.codestra.co/realms/codestra/protocol/openid-connect/token
+          scopes:
+            ai.read: Read AI requests and policy
+            ai.request: Submit governed AI requests
+            ai.cancel: Cancel a governed AI request
+            metrics.read: Read private aggregate metrics
+  parameters:
+    Tenant:
+      name: X-Tenant-ID
+      in: header
+      required: true
+      schema: {type: string, minLength: 1, maxLength: 128}
+    Correlation:
+      name: X-Correlation-ID
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 180}
+    Idempotency:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 200}
+  responses:
+    SafeError:
+      description: Safe error envelope
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ErrorEnvelope"}
+  schemas:
+    GenerationRequest:
+      type: object
+      additionalProperties: false
+      required: [task, input]
+      properties:
+        task:
+          type: string
+          enum: [copy, classify, summarize, score, creative_brief]
+        input: {type: string, minLength: 1, maxLength: 20000}
+        tenant_id: {type: [string, "null"], maxLength: 128}
+        campaign_id: {type: [string, "null"], maxLength: 128}
+        data_class: {type: string, enum: [public, internal, confidential]}
+        region: {type: string, minLength: 2, maxLength: 32}
+        maximum_cost_micros: {type: integer, minimum: 0, maximum: 10000000}
+        retain_output: {type: boolean}
+    GenerationResponse:
+      type: object
+      required: [request_id, status, input_tokens, output_tokens, cost_micros, resource_version]
+      properties:
+        request_id: {type: string, format: uuid}
+        status: {type: string}
+        output: {type: [string, "null"]}
+        provider: {type: [string, "null"]}
+        model: {type: [string, "null"]}
+        input_tokens: {type: integer, minimum: 0}
+        output_tokens: {type: integer, minimum: 0}
+        cost_micros: {type: integer, minimum: 0}
+        middleware_operation_id: {type: [string, "null"], maxLength: 128}
+        resource_version: {type: integer, minimum: 1}
+        created_at: {type: [string, "null"], format: date-time}
+        updated_at: {type: [string, "null"], format: date-time}
+    PagedRequests:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/GenerationResponse"}
+        next_cursor: {type: [string, "null"]}
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, correlation_id, retryable, details]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            correlation_id: {type: string}
+            retryable: {type: boolean}
+            details: {type: object}
