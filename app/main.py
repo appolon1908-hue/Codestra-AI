@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .auth import APP_ENV, authenticate
 from .db import get_session
+from .telemetry import audit_event, configure_telemetry, correlation_id_context
 from .metrics import (
     AUTH_FAILURES,
     CAPABILITY,
@@ -54,9 +55,6 @@ EXTERNAL_MODEL_CALLS_ENABLED = (
     os.getenv("EXTERNAL_MODEL_CALLS_ENABLED", "false").strip().lower() == "true"
 )
 EXTERNAL_MODEL_EXECUTION_AVAILABLE = False
-TELEMETRY_EXPORT_ENABLED = (
-    os.getenv("TELEMETRY_EXPORT_ENABLED", "false").strip().lower() == "true"
-)
 SOURCE_SHA = os.getenv("CODESTRA_GIT_SHA", os.getenv("SOURCE_SHA", "unknown"))
 IMAGE_DIGEST = os.getenv("CODESTRA_IMAGE_DIGEST", os.getenv("IMAGE_DIGEST", "unknown"))
 BUILD_TIMESTAMP = os.getenv("CODESTRA_BUILD_TIMESTAMP", os.getenv("BUILD_TIME", "unknown"))
@@ -65,6 +63,7 @@ DEPLOYMENT_ID = os.getenv("CODESTRA_DEPLOYMENT_ID", "unassigned")
 CORRELATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,179}$")
 
 app = FastAPI(title="Codestra AI Gateway", version=API_VERSION)
+TELEMETRY_EXPORT_ENABLED = configure_telemetry(app)
 bearer_contract = OAuth2(
     flows=OAuthFlows(
         clientCredentials=OAuthFlowClientCredentials(
@@ -256,6 +255,7 @@ async def security_observability_boundary(request: Request, call_next):
                 headers=exc.headers,
             )
     started = time.perf_counter()
+    audit_token = correlation_id_context.set(request.state.correlation_id)
     try:
         response = await call_next(request)
     except HTTPException as exc:
@@ -267,6 +267,7 @@ async def security_observability_boundary(request: Request, call_next):
             retryable=exc.status_code >= 500,
         )
     except Exception:
+        audit_event("request_failed")
         response = _error(
             request,
             status_code=500,
@@ -274,6 +275,8 @@ async def security_observability_boundary(request: Request, call_next):
             message="request could not be completed",
             retryable=True,
         )
+    finally:
+        correlation_id_context.reset(audit_token)
     operation = _operation(request)
     metric_method = request.method if request.method in BOUNDED_METHODS else "OTHER"
     REQUESTS.labels(
@@ -464,6 +467,7 @@ def capabilities() -> dict[str, object]:
         "external_model_calls_enabled": provider_enabled,
         "external_model_calls": provider_enabled,
         "read_only_mode": not provider_enabled,
+        "correlation_ids": True,
         "telemetry_export": TELEMETRY_EXPORT_ENABLED,
         "business_action_authority": False,
     }
@@ -545,6 +549,7 @@ async def generate(
         if row.request_fingerprint != fingerprint:
             IDEMPOTENCY_CONFLICTS.inc()
             raise HTTPException(status_code=409, detail="idempotency_conflict")
+        audit_event("ai_request_replayed", request_id=str(row.id), status=row.status)
         if row.status != "dispatch_pending":
             return _response(row)
     else:
@@ -588,9 +593,11 @@ async def generate(
             if row is None or row.request_fingerprint != fingerprint:
                 IDEMPOTENCY_CONFLICTS.inc()
                 raise HTTPException(status_code=409, detail="idempotency_conflict")
+            audit_event("ai_request_replayed", request_id=str(row.id), status=row.status)
             if row.status != "dispatch_pending":
                 return _response(row)
         await session.refresh(row)
+        audit_event("ai_request_recorded", request_id=str(row.id), status=row.status)
 
     if not provider_enabled:
         POLICY_DENIALS.labels(reason="capability_disabled").inc()
